@@ -41,7 +41,7 @@ describe("formatFaqForPrompt", () => {
   it("FAQがあれば整形された文字列を返す", () => {
     const faqs = searchFaq("料金");
     const formatted = formatFaqForPrompt(faqs);
-    expect(formatted).toContain("参考情報");
+    expect(formatted).toContain("公式情報");
     expect(formatted).toContain("Q:");
     expect(formatted).toContain("A:");
   });

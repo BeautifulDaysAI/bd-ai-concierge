@@ -285,10 +285,10 @@ A: ${f.answer}`,
     )
     .join("\n\n");
 
-  return `## 参考情報（Beautiful Days 公式情報）
+  return `## 公式情報（Beautiful Days 確定事実 — 必ずこの内容に基づいて回答してください）
 
-以下は、ユーザーの質問に関連する Beautiful Days の公式情報です。
-回答する際の参考にしてください。
+以下は Beautiful Days の公式情報です。
+あなた自身の知識ではなく、必ずこの情報を正として回答してください。
 
 ${formatted}
 
