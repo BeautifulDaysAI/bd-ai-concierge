@@ -44,6 +44,15 @@ function isDiagnosticTrigger(text: string): boolean {
   return DIAGNOSTIC_TRIGGERS.some((t) => text.includes(t));
 }
 
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1");
+}
+
 function isInDiagnosticSession(history: { role: "user" | "assistant"; content: string }[]): boolean {
   for (let i = history.length - 1; i >= 0; i--) {
     const msg = history[i];
@@ -110,7 +119,8 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
 
   if (diagnosticMode) {
     console.log("[AI] 診断モード");
-    const response = await generateDiagnosticResponse(userText, history);
+    const rawResponse = await generateDiagnosticResponse(userText, history);
+    const response = stripMarkdown(rawResponse);
     const ngCheck = checkNgWords(response);
     if (!ngCheck.ok) {
       console.warn("[AI] NG検出 → fallback応答", ngCheck.matched);
@@ -147,10 +157,10 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
   let response: string;
   switch (level) {
     case "lv1":
-      response = await generateLv1Response(userText, history, faqContext);
+      response = stripMarkdown(await generateLv1Response(userText, history, faqContext));
       break;
     case "lv2":
-      response = await generateLv2Response(userText, history, faqContext);
+      response = stripMarkdown(await generateLv2Response(userText, history, faqContext));
       break;
     case "lv3":
       response = getLv3Response();
