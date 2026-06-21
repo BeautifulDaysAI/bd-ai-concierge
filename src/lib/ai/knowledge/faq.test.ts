@@ -20,9 +20,20 @@ describe("searchFaq", () => {
     expect(result.some((f) => f.category === "event")).toBe(true);
   });
 
-  it("関係ない質問は空または低スコア", () => {
+  it("診断キーワードで診断情報を返す", () => {
+    const result = searchFaq("ライフプラン診断をしたい");
+    expect(result.length).toBeGreaterThan(0);
+    expect(result.some((f) => f.category === "diagnostic")).toBe(true);
+  });
+
+  it("iDeCoキーワードで一般金融用語を返す", () => {
+    const result = searchFaq("iDeCoについて教えて");
+    expect(result.length).toBeGreaterThan(0);
+    expect(result.some((f) => f.category === "general")).toBe(true);
+  });
+
+  it("関係ない質問は空", () => {
     const result = searchFaq("今日の天気");
-    // キーワードマッチがないので0件
     expect(result.length).toBe(0);
   });
 
@@ -38,7 +49,7 @@ describe("formatFaqForPrompt", () => {
     expect(result).toBe("");
   });
 
-  it("FAQがあれば整形された文字列を返す", () => {
+  it("FAQがあれば公式情報として整形される", () => {
     const faqs = searchFaq("料金");
     const formatted = formatFaqForPrompt(faqs);
     expect(formatted).toContain("公式情報");

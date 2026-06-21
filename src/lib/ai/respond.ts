@@ -1,28 +1,22 @@
 /**
- * AI 応答生成 v2
- *
- * Week 2強化版：
- * - 会員自動登録
- * - 会話履歴を文脈として活用
- * - BD独自FAQの参照
- * - メッセージログのDB保存
- * - NGワード入出力チェック
+ * AI 応答生成
  *
  * 処理の流れ：
  * 1. 会員の取得 or 作成
  * 2. ユーザー入力の安全チェック
- * 3. 3段階フィルターでレベル判定
- * 4. 過去の会話履歴を取得
- * 5. 関連FAQを検索
- * 6. レベル別に応答生成（履歴・FAQを文脈に含める）
- * 7. NGワードチェック
- * 8. ログ保存
+ * 3. 診断モード判定
+ * 4. 3段階フィルターでレベル判定
+ * 5. 過去の会話履歴を取得
+ * 6. 関連FAQを検索
+ * 7. レベル別に応答生成
+ * 8. NGワードチェック
+ * 9. ログ保存
  *
  * © Beautiful Days
  */
 
 import { getAnthropicClient, getDefaultModel } from "./client";
-import { SYSTEM_PROMPT, FILTER_PROMPT } from "./prompts/system";
+import { SYSTEM_PROMPT, FILTER_PROMPT, DIAGNOSTIC_PROMPT } from "./prompts/system";
 import {
   checkNgWords,
   detectProductName,
@@ -39,13 +33,29 @@ import { notifyFp } from "@/lib/notify/fp";
 export type FilterLevel = "lv1" | "lv2" | "lv3";
 
 export type AiRequest = {
-  /** LINE User ID */
   userId: string;
-  /** ユーザーが送ってきたテキスト */
   userText: string;
-  /** LINE Display Name（初回登録用） */
   displayName?: string;
 };
+
+const DIAGNOSTIC_TRIGGERS = ["診断", "ライフプラン診断", "診断したい", "診断スタート", "診断をしたい", "3分診断"];
+
+function isDiagnosticTrigger(text: string): boolean {
+  return DIAGNOSTIC_TRIGGERS.some((t) => text.includes(t));
+}
+
+function isInDiagnosticSession(history: { role: "user" | "assistant"; content: string }[]): boolean {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.role === "assistant" && msg.content.includes("気づきシート")) return false;
+    if (msg.role === "assistant" && msg.content.includes("3分ライフプラン診断")) return true;
+    if (msg.role === "assistant" && msg.content.includes("年代を教えてください")) return true;
+    if (msg.role === "assistant" && msg.content.includes("ご家族構成")) return true;
+    if (msg.role === "assistant" && msg.content.includes("いちばん気になっていること")) return true;
+    if (msg.role === "assistant" && msg.content.includes("なにか対策をされていますか")) return true;
+  }
+  return false;
+}
 
 /**
  * AI 応答を生成する（メインエントリ）
@@ -55,21 +65,19 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
 
   console.log("[AI] 応答生成開始", { userId });
 
-  // 1. 会員を取得 or 作成
   const member = await getOrCreateMember(userId, displayName);
   if (!member) {
     console.error("[AI] 会員取得失敗");
     return SAFE_FALLBACK_RESPONSE;
   }
 
-  // 2. ユーザー入力をログ保存
   await saveMessage({
     memberId: member.id,
     direction: "in",
     content: userText,
   });
 
-  // 3. 個別商品名の検出 → Lv.3 強制
+  // 個別商品名の検出 → Lv.3 強制
   const productCheck = detectProductName(userText);
   if (productCheck.detected) {
     console.log("[AI] 個別商品名検出 → Lv.3", productCheck.products);
@@ -80,7 +88,6 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
       content: response,
       filterLevel: "lv3",
     });
-    // FP に通知（個別商品の相談が来た）
     await notifyFp({
       type: "lv3_inquiry",
       memberName: member.displayName ?? "（名前なし）",
@@ -95,18 +102,48 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
     return response;
   }
 
-  // 4. 3段階フィルターでレベル判定
+  // 会話履歴を取得（直近10件）
+  const history = await getRecentMessages(member.id, 10);
+
+  // 診断モード判定
+  const diagnosticMode = isDiagnosticTrigger(userText) || isInDiagnosticSession(history);
+
+  if (diagnosticMode) {
+    console.log("[AI] 診断モード");
+    const response = await generateDiagnosticResponse(userText, history);
+    const ngCheck = checkNgWords(response);
+    if (!ngCheck.ok) {
+      console.warn("[AI] NG検出 → fallback応答", ngCheck.matched);
+      await saveMessage({
+        memberId: member.id,
+        direction: "out",
+        content: response,
+        filterLevel: "lv1",
+        aiModel: getDefaultModel(),
+        ngDetected: true,
+        ngWords: ngCheck.matched,
+      });
+      return SAFE_FALLBACK_RESPONSE;
+    }
+    await saveMessage({
+      memberId: member.id,
+      direction: "out",
+      content: response,
+      filterLevel: "lv1",
+      aiModel: getDefaultModel(),
+    });
+    return response;
+  }
+
+  // 3段階フィルターでレベル判定
   const level = await classifyMessage(userText);
   console.log("[AI] フィルターレベル:", level);
 
-  // 5. 過去の会話履歴を取得（直近10件）
-  const history = await getRecentMessages(member.id, 10);
-
-  // 6. 関連FAQを検索
+  // 関連FAQを検索
   const relevantFaqs = searchFaq(userText, 3);
   const faqContext = formatFaqForPrompt(relevantFaqs);
 
-  // 7. レベル別に応答生成
+  // レベル別に応答生成
   let response: string;
   switch (level) {
     case "lv1":
@@ -120,12 +157,10 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
       break;
   }
 
-  // 8. 出力側NGワードチェック
+  // 出力側NGワードチェック
   const ngCheck = checkNgWords(response);
   if (!ngCheck.ok) {
     console.warn("[AI] NG検出 → fallback応答", ngCheck.matched);
-
-    // NG検出ログを残す（元の応答を保存）
     await saveMessage({
       memberId: member.id,
       direction: "out",
@@ -135,11 +170,9 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
       ngDetected: true,
       ngWords: ngCheck.matched,
     });
-
     return SAFE_FALLBACK_RESPONSE;
   }
 
-  // 9. 応答ログを保存
   await saveMessage({
     memberId: member.id,
     direction: "out",
@@ -172,12 +205,12 @@ async function classifyMessage(text: string): Promise<FilterLevel> {
     return "lv2";
   } catch (err) {
     console.error("[AI] フィルター判定エラー", err);
-    return "lv2"; // エラー時は安全側に
+    return "lv2";
   }
 }
 
 /**
- * Lv.1: AI即答ゾーン（履歴・FAQを文脈に活用）
+ * Lv.1: AI即答ゾーン
  */
 async function generateLv1Response(
   text: string,
@@ -217,9 +250,8 @@ async function generateLv2Response(
 
 ${faqContext}
 
-なお、このユーザーの質問は個別性のある内容です。
-具体的な判断は AI ではなく FP が行うため、必要な情報を聞き取り、
-FP 相談を提案する応答を生成してください。`;
+このユーザーの質問は個別性のある内容です。
+具体的な判断はFPが行うため、必要な情報を聞き取り、FP相談を提案する応答を生成してください。`;
 
   try {
     const result = await getAnthropicClient().messages.create({
@@ -244,12 +276,37 @@ FP 相談を提案する応答を生成してください。`;
 function getLv3Response(): string {
   return `ご質問ありがとうございます。
 
-このご質問は、担当 FP が直接お答えする内容です。
-詳しいお話を、ぜひ相談時間にお聞かせください。
+この内容は、担当FPが直接お答えする領域です。
+ぜひ相談時間に詳しくお聞かせください。
 
-▼ FP 相談のご予約
-このチャットで「FP相談予約」とお送りください。
-担当者からスケジュール候補をご案内します。
+▼ FP相談のご予約
+「FP相談予約」とお送りください。担当者からスケジュール候補をご案内します。
 
-※ 個別商品のご判断やご契約の検討は、資格を持つ FP が直接ご対応します。`;
+※ 個別商品のご判断やご契約の検討は、資格を持つFPが直接ご対応します。`;
+}
+
+/**
+ * 3分ライフプラン診断モード
+ */
+async function generateDiagnosticResponse(
+  text: string,
+  history: { role: "user" | "assistant"; content: string }[],
+): Promise<string> {
+  const diagnosticSystem = `${SYSTEM_PROMPT}\n\n${DIAGNOSTIC_PROMPT}`;
+
+  try {
+    const result = await getAnthropicClient().messages.create({
+      model: getDefaultModel(),
+      max_tokens: 1500,
+      system: diagnosticSystem,
+      messages: [...history, { role: "user", content: text }],
+    });
+
+    const content = result.content[0];
+    if (content.type !== "text") return SAFE_FALLBACK_RESPONSE;
+    return content.text;
+  } catch (err) {
+    console.error("[AI] 診断応答生成エラー", err);
+    return SAFE_FALLBACK_RESPONSE;
+  }
 }
