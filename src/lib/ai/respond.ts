@@ -1,17 +1,6 @@
 /**
  * AI 応答生成
  *
- * 処理の流れ：
- * 1. 会員の取得 or 作成
- * 2. ユーザー入力の安全チェック
- * 3. 診断モード判定
- * 4. 3段階フィルターでレベル判定
- * 5. 過去の会話履歴を取得
- * 6. 関連FAQを検索
- * 7. レベル別に応答生成
- * 8. NGワードチェック
- * 9. ログ保存
- *
  * © Beautiful Days
  */
 
@@ -38,6 +27,11 @@ export type AiRequest = {
   displayName?: string;
 };
 
+export type AiResult = {
+  text: string;
+  diagnosticComplete: boolean;
+};
+
 const DIAGNOSTIC_TRIGGERS = ["診断", "ライフプラン診断", "診断したい", "診断スタート", "診断をしたい", "3分診断"];
 
 function isDiagnosticTrigger(text: string): boolean {
@@ -62,6 +56,9 @@ function isInDiagnosticSession(history: { role: "user" | "assistant"; content: s
     if (msg.role === "assistant" && msg.content.includes("ご家族構成")) return true;
     if (msg.role === "assistant" && msg.content.includes("いちばん気になっていること")) return true;
     if (msg.role === "assistant" && msg.content.includes("なにか対策をされていますか")) return true;
+    if (msg.role === "assistant" && msg.content.includes("生活費")) return true;
+    if (msg.role === "assistant" && msg.content.includes("割合が大きいと感じる")) return true;
+    if (msg.role === "assistant" && msg.content.includes("お金との付き合い方")) return true;
   }
   return false;
 }
@@ -69,7 +66,7 @@ function isInDiagnosticSession(history: { role: "user" | "assistant"; content: s
 /**
  * AI 応答を生成する（メインエントリ）
  */
-export async function generateAiResponse(req: AiRequest): Promise<string> {
+export async function generateAiResponse(req: AiRequest): Promise<AiResult> {
   const { userId, userText, displayName } = req;
 
   console.log("[AI] 応答生成開始", { userId });
@@ -77,7 +74,7 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
   const member = await getOrCreateMember(userId, displayName);
   if (!member) {
     console.error("[AI] 会員取得失敗");
-    return SAFE_FALLBACK_RESPONSE;
+    return { text: SAFE_FALLBACK_RESPONSE, diagnosticComplete: false };
   }
 
   await saveMessage({
@@ -108,7 +105,7 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
       },
       link: `${process.env.NEXT_PUBLIC_APP_URL}/admin/messages`,
     });
-    return response;
+    return { text: response, diagnosticComplete: false };
   }
 
   // 会話履歴を取得（直近10件）
@@ -121,6 +118,7 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
     console.log("[AI] 診断モード");
     const rawResponse = await generateDiagnosticResponse(userText, history);
     const response = stripMarkdown(rawResponse);
+    const isDiagnosticDone = response.includes("気づきシート");
     const ngCheck = checkNgWords(response);
     if (!ngCheck.ok) {
       console.warn("[AI] NG検出 → fallback応答", ngCheck.matched);
@@ -133,7 +131,7 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
         ngDetected: true,
         ngWords: ngCheck.matched,
       });
-      return SAFE_FALLBACK_RESPONSE;
+      return { text: SAFE_FALLBACK_RESPONSE, diagnosticComplete: false };
     }
     await saveMessage({
       memberId: member.id,
@@ -142,7 +140,7 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
       filterLevel: "lv1",
       aiModel: getDefaultModel(),
     });
-    return response;
+    return { text: response, diagnosticComplete: isDiagnosticDone };
   }
 
   // 3段階フィルターでレベル判定
@@ -180,7 +178,7 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
       ngDetected: true,
       ngWords: ngCheck.matched,
     });
-    return SAFE_FALLBACK_RESPONSE;
+    return { text: SAFE_FALLBACK_RESPONSE, diagnosticComplete: false };
   }
 
   await saveMessage({
@@ -191,7 +189,7 @@ export async function generateAiResponse(req: AiRequest): Promise<string> {
     aiModel: getDefaultModel(),
   });
 
-  return response;
+  return { text: response, diagnosticComplete: false };
 }
 
 /**
@@ -307,7 +305,7 @@ async function generateDiagnosticResponse(
   try {
     const result = await getAnthropicClient().messages.create({
       model: getDefaultModel(),
-      max_tokens: 1500,
+      max_tokens: 2000,
       system: diagnosticSystem,
       messages: [...history, { role: "user", content: text }],
     });
@@ -320,3 +318,5 @@ async function generateDiagnosticResponse(
     return SAFE_FALLBACK_RESPONSE;
   }
 }
+
+export const HOUSEHOLD_IMAGE_URL = "https://bd-ai-concierge.vercel.app/bd-household-sample.png";

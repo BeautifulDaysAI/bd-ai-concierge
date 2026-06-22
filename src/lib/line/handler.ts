@@ -11,7 +11,7 @@
 
 import type { WebhookEvent, MessageEvent } from "@line/bot-sdk";
 import { lineClient } from "./client";
-import { generateAiResponse } from "@/lib/ai/respond";
+import { generateAiResponse, HOUSEHOLD_IMAGE_URL } from "@/lib/ai/respond";
 import { handleDocumentUpload } from "./document-intake";
 import {
   getOrCreateMember,
@@ -95,15 +95,27 @@ async function handleMessage(event: MessageEvent): Promise<void> {
         }
 
         // 3. それ以外は AI 応答
-        const aiReply = await generateAiResponse({
+        const aiResult = await generateAiResponse({
           userId,
           userText,
           displayName,
         });
 
+        const messages: Array<{ type: "text"; text: string } | { type: "image"; originalContentUrl: string; previewImageUrl: string }> = [
+          { type: "text", text: aiResult.text },
+        ];
+
+        if (aiResult.diagnosticComplete) {
+          messages.push({
+            type: "image",
+            originalContentUrl: HOUSEHOLD_IMAGE_URL,
+            previewImageUrl: HOUSEHOLD_IMAGE_URL,
+          });
+        }
+
         await lineClient.replyMessage({
           replyToken,
-          messages: [{ type: "text", text: aiReply }],
+          messages,
         });
       } catch (err) {
         console.error("[LINE] テキスト応答エラー", err);
