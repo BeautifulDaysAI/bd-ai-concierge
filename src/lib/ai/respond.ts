@@ -1,11 +1,11 @@
 /**
- * AI 応答生成
+ * AI 応答生成（アポ獲得特化版）
  *
  * © Beautiful Days
  */
 
 import { getAnthropicClient, getDefaultModel } from "./client";
-import { SYSTEM_PROMPT, FILTER_PROMPT, DIAGNOSTIC_PROMPT } from "./prompts/system";
+import { SYSTEM_PROMPT, FILTER_PROMPT, DIAGNOSTIC_PROMPT, MONEY_DIAGNOSTIC_PROMPT } from "./prompts/system";
 import {
   checkNgWords,
   detectProductName,
@@ -32,10 +32,22 @@ export type AiResult = {
   diagnosticComplete: boolean;
 };
 
-const DIAGNOSTIC_TRIGGERS = ["診断", "ライフプラン診断", "診断したい", "診断スタート", "診断をしたい", "3分診断"];
+const DIAGNOSTIC_TRIGGERS = ["診断したい", "ライフプラン診断", "診断スタート", "診断をしたい", "3分診断"];
+
+const MONEY_DIAGNOSTIC_TRIGGERS = ["お金診断", "タイプ診断", "30秒診断", "性格診断", "お金診断したい"];
+
+const LIFE_EVENT_TRIGGERS = ["ライフイベント"];
 
 function isDiagnosticTrigger(text: string): boolean {
   return DIAGNOSTIC_TRIGGERS.some((t) => text.includes(t));
+}
+
+function isMoneyDiagnosticTrigger(text: string): boolean {
+  return MONEY_DIAGNOSTIC_TRIGGERS.some((t) => text.includes(t));
+}
+
+function isLifeEventTrigger(text: string): boolean {
+  return LIFE_EVENT_TRIGGERS.some((t) => text.includes(t));
 }
 
 function stripMarkdown(text: string): string {
@@ -58,7 +70,21 @@ function isInDiagnosticSession(history: { role: "user" | "assistant"; content: s
     if (msg.role === "assistant" && msg.content.includes("なにか対策をされていますか")) return true;
     if (msg.role === "assistant" && msg.content.includes("生活費")) return true;
     if (msg.role === "assistant" && msg.content.includes("割合が大きいと感じる")) return true;
-    if (msg.role === "assistant" && msg.content.includes("お金との付き合い方")) return true;
+    if (msg.role === "assistant" && msg.content.includes("お金との付き合い方の傾向")) return true;
+  }
+  return false;
+}
+
+function isInMoneyDiagnosticSession(history: { role: "user" | "assistant"; content: string }[]): boolean {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.role === "assistant" && msg.content.includes("30秒お金診断 — あなたのタイプ")) return false;
+    if (msg.role === "assistant" && msg.content.includes("30秒お金診断")) return true;
+    if (msg.role === "assistant" && msg.content.includes("お金についていちばん近い気持ち")) return true;
+    if (msg.role === "assistant" && msg.content.includes("余裕資金ができたら")) return true;
+    if (msg.role === "assistant" && msg.content.includes("10年後の自分")) return true;
+    if (msg.role === "assistant" && msg.content.includes("お金の話を誰かにするとき")) return true;
+    if (msg.role === "assistant" && msg.content.includes("いちばん大切にしたいのは")) return true;
   }
   return false;
 }
@@ -111,7 +137,52 @@ export async function generateAiResponse(req: AiRequest): Promise<AiResult> {
   // 会話履歴を取得（直近10件）
   const history = await getRecentMessages(member.id, 10);
 
-  // 診断モード判定
+  // ライフイベントは即答（セッション管理不要）
+  if (isLifeEventTrigger(userText) && !isInDiagnosticSession(history) && !isInMoneyDiagnosticSession(history)) {
+    console.log("[AI] ライフイベント即答");
+    const response = getLifeEventResponse();
+    await saveMessage({
+      memberId: member.id,
+      direction: "out",
+      content: response,
+      filterLevel: "lv1",
+    });
+    return { text: response, diagnosticComplete: false };
+  }
+
+  // 30秒お金診断モード判定
+  const moneyDiagnosticMode = isMoneyDiagnosticTrigger(userText) || isInMoneyDiagnosticSession(history);
+
+  if (moneyDiagnosticMode) {
+    console.log("[AI] 30秒お金診断モード");
+    const rawResponse = await generateMoneyDiagnosticResponse(userText, history);
+    const response = stripMarkdown(rawResponse);
+    const isMoneyDiagnosticDone = response.includes("30秒お金診断 — あなたのタイプ");
+    const ngCheck = checkNgWords(response);
+    if (!ngCheck.ok) {
+      console.warn("[AI] NG検出 → fallback応答", ngCheck.matched);
+      await saveMessage({
+        memberId: member.id,
+        direction: "out",
+        content: response,
+        filterLevel: "lv1",
+        aiModel: getDefaultModel(),
+        ngDetected: true,
+        ngWords: ngCheck.matched,
+      });
+      return { text: SAFE_FALLBACK_RESPONSE, diagnosticComplete: false };
+    }
+    await saveMessage({
+      memberId: member.id,
+      direction: "out",
+      content: response,
+      filterLevel: "lv1",
+      aiModel: getDefaultModel(),
+    });
+    return { text: response, diagnosticComplete: isMoneyDiagnosticDone };
+  }
+
+  // 3分ライフプラン診断モード判定
   const diagnosticMode = isDiagnosticTrigger(userText) || isInDiagnosticSession(history);
 
   if (diagnosticMode) {
@@ -259,7 +330,7 @@ async function generateLv2Response(
 ${faqContext}
 
 このユーザーの質問は個別性のある内容です。
-具体的な判断はFPが行うため、必要な情報を聞き取り、FP相談を提案する応答を生成してください。`;
+具体的な判断は担当者が行うため、必要な情報を聞き取り、相談予約を提案する応答を生成してください。`;
 
   try {
     const result = await getAnthropicClient().messages.create({
@@ -279,18 +350,18 @@ ${faqContext}
 }
 
 /**
- * Lv.3: 即 FP誘導
+ * Lv.3: 即 相談予約誘導
  */
 function getLv3Response(): string {
   return `ご質問ありがとうございます。
 
-この内容は、担当FPが直接お答えする領域です。
+この内容は、担当者が直接お答えする領域です。
 ぜひ相談時間に詳しくお聞かせください。
 
-▼ FP相談のご予約
-「FP相談予約」とお送りください。担当者からスケジュール候補をご案内します。
+個別の状況に合わせた具体的なご提案は、担当者がお伺いします。
+「相談予約」とお送りいただくか、リッチメニューの「相談予約」ボタンからどうぞ。
 
-※ 個別商品のご判断やご契約の検討は、資格を持つFPが直接ご対応します。`;
+※ 個別商品のご判断やご契約の検討は、担当者が直接ご対応します。`;
 }
 
 /**
@@ -317,6 +388,51 @@ async function generateDiagnosticResponse(
     console.error("[AI] 診断応答生成エラー", err);
     return SAFE_FALLBACK_RESPONSE;
   }
+}
+
+/**
+ * 30秒お金診断モード
+ */
+async function generateMoneyDiagnosticResponse(
+  text: string,
+  history: { role: "user" | "assistant"; content: string }[],
+): Promise<string> {
+  const moneyDiagnosticSystem = `${SYSTEM_PROMPT}\n\n${MONEY_DIAGNOSTIC_PROMPT}`;
+
+  try {
+    const result = await getAnthropicClient().messages.create({
+      model: getDefaultModel(),
+      max_tokens: 1500,
+      system: moneyDiagnosticSystem,
+      messages: [...history, { role: "user", content: text }],
+    });
+
+    const content = result.content[0];
+    if (content.type !== "text") return SAFE_FALLBACK_RESPONSE;
+    return content.text;
+  } catch (err) {
+    console.error("[AI] 30秒お金診断応答生成エラー", err);
+    return SAFE_FALLBACK_RESPONSE;
+  }
+}
+
+/**
+ * ライフイベント即答
+ */
+function getLifeEventResponse(): string {
+  return `▼ 主なライフイベントと一般的な必要資金の目安
+
+・結婚: 一般的に300〜500万円程度
+・出産・育児: 一般的に100〜200万円/子1人
+・住宅購入: 一般的に物件価格の20〜30%（頭金）
+・教育: 大学まで一般的に1,000〜2,000万円/子1人
+・老後: 一般的に2,000〜3,000万円が目安と言われる
+・親の介護: 一般的に500〜1,000万円
+
+※ すべて一般的な目安で、個別の状況により大きく異なります。
+
+あなたの場合の具体的な準備は担当者がお伺いします。
+「相談予約」とお送りいただくか、リッチメニューの「相談予約」ボタンからどうぞ。`;
 }
 
 export const HOUSEHOLD_IMAGE_URL = "https://bd-ai-concierge.vercel.app/bd-household-sample.png";
