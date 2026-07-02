@@ -103,11 +103,7 @@ export async function generateAiResponse(req: AiRequest): Promise<AiResult> {
     return { text: SAFE_FALLBACK_RESPONSE, diagnosticComplete: false };
   }
 
-  await saveMessage({
-    memberId: member.id,
-    direction: "in",
-    content: userText,
-  });
+  // ユーザー入力はhandler.tsで保存済み
 
   // 個別商品名の検出 → Lv.3 強制
   const productCheck = detectProductName(userText);

@@ -12,7 +12,10 @@ import {
   getOrCreateMember,
   markMemberDeleted,
 } from "@/lib/db/queries/members";
-import { getRecentMessages } from "@/lib/db/queries/messages";
+import {
+  saveMessage,
+  getRecentMessages,
+} from "@/lib/db/queries/messages";
 import {
   isAppointmentRequest,
   isInReservationSession,
@@ -70,13 +73,19 @@ async function handleMessage(event: MessageEvent): Promise<void> {
           return;
         }
 
+        // ユーザー入力を保存
+        await saveMessage({
+          memberId: member.id,
+          direction: "in",
+          content: userText,
+        });
+
         const history = await getRecentMessages(member.id, 10);
 
         // 1. 予約セッション中の処理
         if (isInReservationSession(history)) {
           const step = getReservationStep(history);
 
-          // 候補表示後 → 番号選択を試す
           if (step === "show_slots") {
             const confirmReply = await tryConfirmAppointment(
               userText,
@@ -85,14 +94,15 @@ async function handleMessage(event: MessageEvent): Promise<void> {
               history,
             );
             if (confirmReply) {
+              await saveMessage({ memberId: member.id, direction: "out", content: confirmReply });
               await lineClient.replyMessage({
                 replyToken,
                 messages: [{ type: "text", text: confirmReply }],
               });
               return;
             }
-            // 番号じゃない → 新しい希望として再検索
             const slotsReply = await handlePreferenceAndFindSlots(userText);
+            await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
             await lineClient.replyMessage({
               replyToken,
               messages: [{ type: "text", text: slotsReply }],
@@ -100,9 +110,9 @@ async function handleMessage(event: MessageEvent): Promise<void> {
             return;
           }
 
-          // 希望日時質問後 → 希望をパースして候補検索
           if (step === "ask_preference") {
             const slotsReply = await handlePreferenceAndFindSlots(userText);
+            await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
             await lineClient.replyMessage({
               replyToken,
               messages: [{ type: "text", text: slotsReply }],
@@ -113,16 +123,16 @@ async function handleMessage(event: MessageEvent): Promise<void> {
 
         // 2. 「相談予約」検出 → フロー開始
         if (isAppointmentRequest(userText)) {
+          const promptMsg = getAppointmentPromptMessage();
+          await saveMessage({ memberId: member.id, direction: "out", content: promptMsg });
           await lineClient.replyMessage({
             replyToken,
-            messages: [
-              { type: "text", text: getAppointmentPromptMessage() },
-            ],
+            messages: [{ type: "text", text: promptMsg }],
           });
           return;
         }
 
-        // 3. それ以外は AI 応答
+        // 3. それ以外は AI 応答（respond.ts内でsaveMessage済み）
         const aiResult = await generateAiResponse({
           userId,
           userText,
