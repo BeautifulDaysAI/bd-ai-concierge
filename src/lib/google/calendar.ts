@@ -178,6 +178,13 @@ export async function findAvailableSlotsOnDate(
   const calendar = getCalendarClient();
   const calendarId = getCalendarId();
 
+  console.log("[Calendar] freeBusy検索", {
+    calendarId,
+    date: `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
+    hasClientId: !!process.env.GOOGLE_CLIENT_ID,
+    hasRefreshToken: !!process.env.GOOGLE_REFRESH_TOKEN,
+  });
+
   const dayStart = jstToUtc(year, month, day, schedule.open);
   const dayEnd = jstToUtc(year, month, day, schedule.close);
 
@@ -191,6 +198,7 @@ export async function findAvailableSlotsOnDate(
   });
 
   const busySlots = freeBusyRes.data.calendars?.[calendarId]?.busy ?? [];
+  console.log("[Calendar] busy区間:", busySlots.length, "件", busySlots.map((b) => `${b.start}〜${b.end}`));
   const busyRanges = busySlots.map((b) => ({
     start: new Date(b.start!),
     end: new Date(b.end!),
