@@ -26,10 +26,12 @@ import {
   handlePreferenceAndFindDates,
   handleDateSelectionAndFindSlots,
   tryConfirmAppointment,
+  isDayOfWeekPreference,
   isBusinessDayQuestion,
   isGeneralQuestion,
   answerInterruptionQuestion,
   BUSINESS_DAY_POLICY,
+  SUNDAY_REJECTION_IN_FLOW,
   FLOW_CONTINUE_PROMPT,
 } from "./appointment-flow";
 
@@ -120,7 +122,19 @@ async function handleMessage(event: MessageEvent): Promise<void> {
               });
               return;
             }
-            // 番号以外 → 割り込み質問の3段階判定
+            // 番号以外 → 割り込み4段階判定
+            const timePref = isDayOfWeekPreference(userText);
+            if (timePref.match) {
+              if (timePref.isSunday) {
+                await saveMessage({ memberId: member.id, direction: "out", content: SUNDAY_REJECTION_IN_FLOW });
+                await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: SUNDAY_REJECTION_IN_FLOW }] });
+                return;
+              }
+              const datesReply = await handlePreferenceAndFindDates(userText, history);
+              await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: datesReply }] });
+              return;
+            }
             if (isBusinessDayQuestion(userText)) {
               await saveMessage({ memberId: member.id, direction: "out", content: BUSINESS_DAY_POLICY });
               await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: BUSINESS_DAY_POLICY }] });
@@ -153,7 +167,19 @@ async function handleMessage(event: MessageEvent): Promise<void> {
               });
               return;
             }
-            // 番号以外 → 割り込み質問の3段階判定
+            // 番号以外 → 割り込み4段階判定
+            const datesPref = isDayOfWeekPreference(userText);
+            if (datesPref.match) {
+              if (datesPref.isSunday) {
+                await saveMessage({ memberId: member.id, direction: "out", content: SUNDAY_REJECTION_IN_FLOW });
+                await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: SUNDAY_REJECTION_IN_FLOW }] });
+                return;
+              }
+              const newDatesReply = await handlePreferenceAndFindDates(userText, history);
+              await saveMessage({ memberId: member.id, direction: "out", content: newDatesReply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: newDatesReply }] });
+              return;
+            }
             if (isBusinessDayQuestion(userText)) {
               await saveMessage({ memberId: member.id, direction: "out", content: BUSINESS_DAY_POLICY });
               await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: BUSINESS_DAY_POLICY }] });

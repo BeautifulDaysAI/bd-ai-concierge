@@ -69,11 +69,33 @@ function detectDayOfWeekFromHistory(
 
 // ── 割り込み質問の検出 ──
 
-const BUSINESS_DAY_KEYWORDS = /土日|週末|土曜|日曜|平日|休み|やって(い|な)|営業|祝日/;
-const QUESTION_INDICATORS = /？|\?|ですか|でしょうか|ありますか|いますか|なの|かな|って|けど|のは|どう/;
+const DAY_KEYWORDS = /土日|週末|土曜|日曜|平日|休み|やって(い|な)|営業|祝日/;
+const PREFERENCE_INDICATORS = /でやりたい|がいい|がいい|希望|にして|でお願い|がいいな|で$/;
+const QUESTION_INDICATORS = /？|\?|ですか|でしょうか|ありますか|いますか|なの|かな|けど|のは|どう/;
 
+/**
+ * 曜日を含む「希望変更」を検出（「土曜でやりたい」「平日がいい」等）
+ * 日曜希望か否かも返す
+ */
+export function isDayOfWeekPreference(text: string): { match: boolean; isSunday: boolean; dayOfWeek: number | null } {
+  const dow = detectDayOfWeek(text);
+  if (dow !== null) {
+    if (QUESTION_INDICATORS.test(text) && !PREFERENCE_INDICATORS.test(text)) {
+      return { match: false, isSunday: false, dayOfWeek: null };
+    }
+    return { match: true, isSunday: dow === 0, dayOfWeek: dow };
+  }
+  if (/平日/.test(text) && PREFERENCE_INDICATORS.test(text)) {
+    return { match: true, isSunday: false, dayOfWeek: null };
+  }
+  return { match: false, isSunday: false, dayOfWeek: null };
+}
+
+/**
+ * 営業曜日に関する「純粋な質問」を検出（「土日やってない？」等）
+ */
 export function isBusinessDayQuestion(text: string): boolean {
-  return BUSINESS_DAY_KEYWORDS.test(text);
+  return DAY_KEYWORDS.test(text) && QUESTION_INDICATORS.test(text);
 }
 
 export function isGeneralQuestion(text: string): boolean {
@@ -82,6 +104,9 @@ export function isGeneralQuestion(text: string): boolean {
 
 export const BUSINESS_DAY_POLICY = `ご相談は月〜土で承っております（日曜はお休みです）。
 上記の候補からご希望の番号をお選びください。`;
+
+export const SUNDAY_REJECTION_IN_FLOW = `日曜はお休みをいただいております。
+月曜〜土曜でご希望の曜日・時間帯をお知らせください。`;
 
 export const FLOW_CONTINUE_PROMPT = "\n\n引き続き、上記の候補から番号でお選びください。";
 
@@ -218,7 +243,6 @@ async function parsePreference(
   to: Date;
   preferredHourStart: number;
   preferredHourEnd: number;
-  weekdaysOnly: boolean;
   targetDayOfWeek?: number;
 }> {
   const jst = getNowJst();
@@ -262,7 +286,6 @@ ${contextText}
   "toDaysOffset": 検索終了日（今日から何日後。最大60。「来週」なら${daysUntilNextMonday + 6}。曜日指定のみで時期指定なしなら28）,
   "hourStart": 希望開始時間（9-21の整数。「午後」なら13、「夕方」なら17、「19時以降」なら19。指定なしは9）,
   "hourEnd": 希望終了時間（9-21の整数。「午前中」なら12、「午後」なら18。指定なしは21）,
-  "weekdaysOnly": 平日のみか（true/false。土日希望や曜日指定ありならfalse）,
   "dayOfWeek": 特定曜日指定（0=日,1=月,2=火,3=水,4=木,5=金,6=土。指定なしはnull。「土曜」なら6、「月曜」なら1）
 }`;
 
@@ -284,7 +307,6 @@ ${contextText}
       toDaysOffset: number;
       hourStart: number;
       hourEnd: number;
-      weekdaysOnly: boolean;
       dayOfWeek: number | null;
     };
 
@@ -315,13 +337,13 @@ ${contextText}
       hourEnd,
     );
 
-    return { from, to, preferredHourStart: hourStart, preferredHourEnd: hourEnd, weekdaysOnly: parsed.weekdaysOnly, targetDayOfWeek };
+    return { from, to, preferredHourStart: hourStart, preferredHourEnd: hourEnd, targetDayOfWeek };
   } catch (err) {
     console.warn("[Reservation] 希望パース失敗、デフォルト使用", err);
     const detectedDow = detectDayOfWeekFromHistory(userText, history);
     const from = jstToUtc(jst.year, jst.month, jst.day + 1, 9);
     const to = jstToUtc(jst.year, jst.month, jst.day + (detectedDow !== null ? 28 : 14), 21);
-    return { from, to, preferredHourStart: 9, preferredHourEnd: 21, weekdaysOnly: detectedDow === null, targetDayOfWeek: detectedDow ?? undefined };
+    return { from, to, preferredHourStart: 9, preferredHourEnd: 21, targetDayOfWeek: detectedDow ?? undefined };
   }
 }
 
@@ -354,7 +376,6 @@ export async function handlePreferenceAndFindDates(
     const dates = findAvailableDates({
       from: constraints.from,
       to: constraints.to,
-      weekdaysOnly: constraints.weekdaysOnly,
       targetDayOfWeek: constraints.targetDayOfWeek,
     });
 

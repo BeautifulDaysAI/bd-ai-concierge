@@ -128,10 +128,9 @@ function getBusinessHours(schedule: DaySchedule): number[] {
 export function findAvailableDates(constraints: {
   from: Date;
   to: Date;
-  weekdaysOnly?: boolean;
   targetDayOfWeek?: number;
 }): Array<{ year: number; month: number; day: number; dayOfWeek: number; schedule: DaySchedule }> {
-  const { from, to, weekdaysOnly = false, targetDayOfWeek } = constraints;
+  const { from, to, targetDayOfWeek } = constraints;
 
   const now = new Date();
   const earliest = new Date(now.getTime() + MIN_ADVANCE_HOURS * 60 * 60 * 1000);
@@ -152,10 +151,6 @@ export function findAvailableDates(constraints: {
     const schedule = getDaySchedule(jst.year, jst.month, jst.day, jst.dayOfWeek);
 
     if (schedule) {
-      if (weekdaysOnly && jst.dayOfWeek === 6) {
-        cursor = jstToUtc(jst.year, jst.month, jst.day + 1, 0);
-        continue;
-      }
       if (targetDayOfWeek !== undefined && jst.dayOfWeek !== targetDayOfWeek) {
         cursor = jstToUtc(jst.year, jst.month, jst.day + 1, 0);
         continue;
@@ -243,7 +238,6 @@ export async function findAvailableSlots(constraints: {
   to: Date;
   preferredHourStart?: number;
   preferredHourEnd?: number;
-  weekdaysOnly?: boolean;
   maxResults?: number;
 }): Promise<TimeSlot[]> {
   const {
@@ -251,7 +245,6 @@ export async function findAvailableSlots(constraints: {
     to,
     preferredHourStart,
     preferredHourEnd,
-    weekdaysOnly = true,
     maxResults = 3,
   } = constraints;
 
@@ -260,10 +253,9 @@ export async function findAvailableSlots(constraints: {
     to: to.toISOString(),
     preferredHourStart,
     preferredHourEnd,
-    weekdaysOnly,
   });
 
-  const dates = findAvailableDates({ from, to, weekdaysOnly });
+  const dates = findAvailableDates({ from, to });
   console.log("[Calendar] 候補日数:", dates.length);
 
   const allSlots: TimeSlot[] = [];
