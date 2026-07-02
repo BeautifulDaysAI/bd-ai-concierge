@@ -11,6 +11,8 @@ export type NotifyType =
   | "document_received" // 資料お預かり
   | "lv3_inquiry"       // Lv.3 相談（FP直行案件）
   | "fp_appointment"    // FP相談予約
+  | "cancel_appointment" // 予約キャンセル
+  | "cancel_error"      // キャンセル処理エラー
   | "ng_detected"       // NG検出（要レビュー）
   | "morning_brief_ready"; // 朝の市況ドラフト準備完了
 
@@ -27,6 +29,8 @@ const TYPE_EMOJI: Record<NotifyType, string> = {
   document_received: "📩",
   lv3_inquiry: "🚨",
   fp_appointment: "📅",
+  cancel_appointment: "❌",
+  cancel_error: "🔴",
   ng_detected: "⚠️",
   morning_brief_ready: "☀️",
 };
@@ -35,6 +39,8 @@ const TYPE_LABEL: Record<NotifyType, string> = {
   document_received: "資料お預かり",
   lv3_inquiry: "FP直行案件 (Lv.3)",
   fp_appointment: "FP相談予約",
+  cancel_appointment: "予約キャンセル",
+  cancel_error: "キャンセル処理エラー",
   ng_detected: "NG検出",
   morning_brief_ready: "朝の市況ドラフト",
 };

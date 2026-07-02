@@ -21,6 +21,7 @@ export type FpAppointment = {
   status: AppointmentStatus;
   fpName: string | null;
   notes: string | null;
+  googleEventId: string | null;
   createdAt: string;
 };
 
@@ -33,6 +34,7 @@ export async function createAppointment(input: {
   durationMinutes?: number;
   hearingSummary?: string;
   fpName?: string;
+  googleEventId?: string;
 }): Promise<FpAppointment | null> {
   const { data, error } = await supabaseAdmin
     .from("fp_appointments")
@@ -42,6 +44,7 @@ export async function createAppointment(input: {
       duration_minutes: input.durationMinutes ?? 30,
       hearing_summary: input.hearingSummary ?? null,
       fp_name: input.fpName ?? null,
+      google_event_id: input.googleEventId ?? null,
       status: "scheduled",
     })
     .select()
@@ -93,6 +96,44 @@ export async function getMemberAppointments(
   return data.map(mapAppointment);
 }
 
+/**
+ * 会員の直近の未キャンセル予約を取得
+ */
+export async function getLatestScheduledAppointment(
+  memberId: string,
+): Promise<FpAppointment | null> {
+  const { data, error } = await supabaseAdmin
+    .from("fp_appointments")
+    .select("*")
+    .eq("member_id", memberId)
+    .eq("status", "scheduled")
+    .gte("scheduled_at", new Date().toISOString())
+    .order("scheduled_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (error || !data) return null;
+  return mapAppointment(data);
+}
+
+/**
+ * 予約をキャンセル済みに更新
+ */
+export async function cancelAppointment(
+  appointmentId: string,
+): Promise<boolean> {
+  const { error } = await supabaseAdmin
+    .from("fp_appointments")
+    .update({ status: "cancelled" })
+    .eq("id", appointmentId);
+
+  if (error) {
+    console.error("[Appointments] キャンセル更新エラー", error);
+    return false;
+  }
+  return true;
+}
+
 function mapAppointment(row: Record<string, unknown>): FpAppointment {
   return {
     id: row.id as string,
@@ -103,6 +144,7 @@ function mapAppointment(row: Record<string, unknown>): FpAppointment {
     status: row.status as AppointmentStatus,
     fpName: row.fp_name as string | null,
     notes: row.notes as string | null,
+    googleEventId: (row.google_event_id as string) ?? null,
     createdAt: row.created_at as string,
   };
 }

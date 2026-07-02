@@ -15,11 +15,16 @@ import {
   findAvailableDates,
   findAvailableSlotsOnDate,
   createReservation,
+  deleteCalendarEvent,
   getNowJst,
   jstToUtc,
   getJstPartsPublic,
 } from "@/lib/google/calendar";
-import { createAppointment } from "@/lib/db/queries/appointments";
+import {
+  createAppointment,
+  getLatestScheduledAppointment,
+  cancelAppointment,
+} from "@/lib/db/queries/appointments";
 import { notifyFp } from "@/lib/notify/fp";
 import { searchFaq, formatFaqForPrompt } from "@/lib/ai/knowledge/faq";
 import { SYSTEM_PROMPT } from "@/lib/ai/prompts/system";
@@ -602,6 +607,7 @@ export async function tryConfirmAppointment(
     memberId,
     scheduledAt: parsed.toISOString(),
     durationMinutes: 60,
+    googleEventId: calResult.eventId,
   });
 
   if (!appt) {
@@ -652,4 +658,63 @@ function parseSlotLabel(label: string): Date | null {
   }
 
   return date;
+}
+
+// ── キャンセルフロー ──
+
+const CANCEL_KEYWORDS = ["予約キャンセル", "予約変更", "キャンセルしたい", "予約を取り消し", "予約取り消し"];
+
+export function isCancelRequest(text: string): boolean {
+  return CANCEL_KEYWORDS.some((kw) => text.includes(kw));
+}
+
+export async function handleCancelRequest(
+  memberId: string,
+  memberName: string,
+): Promise<string> {
+  const appt = await getLatestScheduledAppointment(memberId);
+  if (!appt) {
+    return "現在、有効な予約が見つかりませんでした。\n新たに予約する場合は「相談予約」とお送りください。";
+  }
+
+  const scheduledJst = getJstPartsPublic(new Date(appt.scheduledAt));
+  const label = `${scheduledJst.month + 1}/${scheduledJst.day}(${WEEKDAYS[scheduledJst.dayOfWeek]}) ${String(scheduledJst.hour).padStart(2, "0")}:00`;
+
+  if (appt.googleEventId) {
+    const deleteResult = await deleteCalendarEvent(appt.googleEventId);
+    if (!deleteResult.success) {
+      console.error("[Reservation] カレンダー削除失敗", deleteResult.error);
+      await notifyFp({
+        type: "cancel_error",
+        memberName,
+        memberId,
+        summary: `カレンダー削除失敗: ${label}`,
+        details: { error: deleteResult.error, appointmentId: appt.id },
+        link: `${process.env.NEXT_PUBLIC_APP_URL}/admin/appointments`,
+      });
+    }
+  } else {
+    console.warn("[Reservation] google_event_id が未保存のためカレンダー削除をスキップ");
+  }
+
+  const cancelled = await cancelAppointment(appt.id);
+  if (!cancelled) {
+    return "申し訳ありません、キャンセル処理中にエラーが発生しました。\n担当者に直接ご連絡ください。";
+  }
+
+  await notifyFp({
+    type: "cancel_appointment",
+    memberName,
+    memberId,
+    summary: `予約キャンセル: ${label}`,
+    details: { appointmentId: appt.id, scheduledAt: appt.scheduledAt },
+    link: `${process.env.NEXT_PUBLIC_APP_URL}/admin/appointments`,
+  });
+
+  return `以下の予約をキャンセルしました。
+
+▼ キャンセル済み
+日時：${label}
+
+再度予約する場合は「相談予約」とお送りください。`;
 }

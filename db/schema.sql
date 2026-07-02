@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS fp_appointments (
   ),
   fp_name TEXT,
   notes TEXT,            -- FP記入欄
+  google_event_id TEXT,  -- Google Calendar イベントID（キャンセル時に使用）
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

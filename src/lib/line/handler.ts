@@ -20,6 +20,8 @@ import {
 } from "@/lib/db/queries/messages";
 import {
   isAppointmentRequest,
+  isCancelRequest,
+  handleCancelRequest,
   isInReservationSession,
   getReservationStep,
   getAppointmentPromptMessage,
@@ -90,6 +92,20 @@ async function handleMessage(event: MessageEvent): Promise<void> {
         });
 
         const history = await getRecentMessages(member.id, 10);
+
+        // 0. 予約キャンセル検出（最優先）
+        if (isCancelRequest(userText)) {
+          const cancelReply = await handleCancelRequest(
+            member.id,
+            member.displayName ?? "会員様",
+          );
+          await saveMessage({ memberId: member.id, direction: "out", content: cancelReply });
+          await lineClient.replyMessage({
+            replyToken,
+            messages: [{ type: "text", text: cancelReply }],
+          });
+          return;
+        }
 
         // 1. 「相談予約」検出 → フロー（再）開始（セッション判定より先に評価）
         if (isAppointmentRequest(userText)) {

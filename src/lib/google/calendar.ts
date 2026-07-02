@@ -313,6 +313,29 @@ export async function createReservation(
 }
 
 /**
+ * Googleカレンダーからイベントを削除
+ */
+export async function deleteCalendarEvent(
+  eventId: string,
+): Promise<{ success: boolean; error?: string }> {
+  const calendar = getCalendarClient();
+  const calendarId = getCalendarId();
+
+  try {
+    await calendar.events.delete({ calendarId, eventId });
+    return { success: true };
+  } catch (err: unknown) {
+    const status = (err as { code?: number })?.code;
+    if (status === 404 || status === 410) {
+      console.warn("[Calendar] イベント既に削除済み", eventId);
+      return { success: true };
+    }
+    console.error("[Calendar] イベント削除エラー", err);
+    return { success: false, error: String(err) };
+  }
+}
+
+/**
  * UTC DateをJST表示ラベルに変換
  */
 function formatSlotLabelJst(utcDate: Date): string {
