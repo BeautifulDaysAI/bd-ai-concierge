@@ -1,10 +1,5 @@
 /**
- * LINE イベントハンドラ v2
- *
- * Week 2強化版：
- * - LINE プロフィール取得（displayName）で初回登録時の名前保存
- * - 退会・ブロック時の自動退会処理
- * - エラー時の安全な応答
+ * LINE イベントハンドラ（アポ獲得特化版）
  *
  * © Beautiful Days
  */
@@ -17,9 +12,13 @@ import {
   getOrCreateMember,
   markMemberDeleted,
 } from "@/lib/db/queries/members";
+import { getRecentMessages } from "@/lib/db/queries/messages";
 import {
   isAppointmentRequest,
+  isInReservationSession,
+  getReservationStep,
   getAppointmentPromptMessage,
+  handlePreferenceAndFindSlots,
   tryConfirmAppointment,
 } from "./appointment-flow";
 
@@ -53,7 +52,6 @@ async function handleMessage(event: MessageEvent): Promise<void> {
     return;
   }
 
-  // プロフィールを取得（初回登録のため）
   let displayName: string | undefined;
   try {
     const profile = await lineClient.getProfile(userId);
@@ -66,32 +64,62 @@ async function handleMessage(event: MessageEvent): Promise<void> {
     case "text": {
       const userText = message.text;
       try {
-        // 1. 予約番号選択を最優先で処理
         const member = await getOrCreateMember(userId, displayName);
-        if (member) {
-          const confirmReply = await tryConfirmAppointment(
-            userText,
-            member.id,
-            member.displayName ?? "会員様",
-          );
-          if (confirmReply) {
+        if (!member) {
+          await safeErrorReply(replyToken);
+          return;
+        }
+
+        const history = await getRecentMessages(member.id, 10);
+
+        // 1. 予約セッション中の処理
+        if (isInReservationSession(history)) {
+          const step = getReservationStep(history);
+
+          // 候補表示後 → 番号選択を試す
+          if (step === "show_slots") {
+            const confirmReply = await tryConfirmAppointment(
+              userText,
+              member.id,
+              member.displayName ?? "会員様",
+              history,
+            );
+            if (confirmReply) {
+              await lineClient.replyMessage({
+                replyToken,
+                messages: [{ type: "text", text: confirmReply }],
+              });
+              return;
+            }
+            // 番号じゃない → 新しい希望として再検索
+            const slotsReply = await handlePreferenceAndFindSlots(userText);
             await lineClient.replyMessage({
               replyToken,
-              messages: [{ type: "text", text: confirmReply }],
+              messages: [{ type: "text", text: slotsReply }],
             });
             return;
           }
 
-          // 2. 「FP相談予約」検出
-          if (isAppointmentRequest(userText)) {
+          // 希望日時質問後 → 希望をパースして候補検索
+          if (step === "ask_preference") {
+            const slotsReply = await handlePreferenceAndFindSlots(userText);
             await lineClient.replyMessage({
               replyToken,
-              messages: [
-                { type: "text", text: getAppointmentPromptMessage() },
-              ],
+              messages: [{ type: "text", text: slotsReply }],
             });
             return;
           }
+        }
+
+        // 2. 「相談予約」検出 → フロー開始
+        if (isAppointmentRequest(userText)) {
+          await lineClient.replyMessage({
+            replyToken,
+            messages: [
+              { type: "text", text: getAppointmentPromptMessage() },
+            ],
+          });
+          return;
         }
 
         // 3. それ以外は AI 応答
@@ -140,7 +168,6 @@ async function handleMessage(event: MessageEvent): Promise<void> {
     }
 
     default:
-      // スタンプ・動画など
       await lineClient.replyMessage({
         replyToken,
         messages: [
@@ -159,7 +186,6 @@ async function handleFollow(event: WebhookEvent): Promise<void> {
   const userId = event.source.userId;
   if (!userId) return;
 
-  // プロフィール取得
   let displayName: string | undefined;
   try {
     const profile = await lineClient.getProfile(userId);
@@ -168,7 +194,6 @@ async function handleFollow(event: WebhookEvent): Promise<void> {
     console.warn("[LINE] プロフィール取得失敗", err);
   }
 
-  // 会員登録
   await getOrCreateMember(userId, displayName);
 
   const welcomeMessage = `${displayName ? displayName + " 様、" : ""}友だち追加ありがとうございます。
@@ -199,15 +224,9 @@ async function handleUnfollow(event: WebhookEvent): Promise<void> {
   if (!userId) return;
 
   console.log("[LINE] ユーザーがブロック/退会:", userId);
-
-  // 退会処理（ソフトデリート）
-  // 30日後にpg_cronで物理削除
   await markMemberDeleted(userId);
 }
 
-/**
- * エラー時の安全な応答（replyTokenがまだ有効なら）
- */
 async function safeErrorReply(replyToken: string): Promise<void> {
   try {
     await lineClient.replyMessage({
