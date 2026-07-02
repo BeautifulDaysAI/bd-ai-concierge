@@ -238,31 +238,70 @@ export async function handlePreferenceAndFindDates(
   }
 }
 
+/**
+ * ユーザー入力から日付候補のインデックスを特定
+ * 番号（「4」「4番」）、日付（「7/9」「7月9日」「9日」）、曜日（「水曜」）に対応
+ */
+function resolveSelectedDate(input: string, dateLabels: string[]): number | null {
+  // 1. 番号マッチ（「4」「4番」「４」）
+  const numMatch = input.match(/^([1-9１-９])[番.\s]?$/);
+  if (numMatch) {
+    const numMap: Record<string, number> = {
+      "1": 1, "2": 2, "3": 3, "4": 4, "5": 5,
+      "6": 6, "7": 7, "8": 8, "9": 9,
+      "１": 1, "２": 2, "３": 3, "４": 4, "５": 5,
+      "６": 6, "７": 7, "８": 8, "９": 9,
+    };
+    const num = numMap[numMatch[1]];
+    if (num && num <= dateLabels.length) return num - 1;
+  }
+
+  // 2. 日付マッチ（「7/9」「7月9日」「9日」）
+  const dateTextMatch = input.match(/(?:(\d{1,2})[\/月])?(\d{1,2})日?$/);
+  if (dateTextMatch) {
+    const targetMonth = dateTextMatch[1] ? parseInt(dateTextMatch[1], 10) : null;
+    const targetDay = parseInt(dateTextMatch[2], 10);
+
+    for (let i = 0; i < dateLabels.length; i++) {
+      const labelMatch = dateLabels[i].match(/(\d+)\/(\d+)/);
+      if (!labelMatch) continue;
+      const labelMonth = parseInt(labelMatch[1], 10);
+      const labelDay = parseInt(labelMatch[2], 10);
+      if (labelDay === targetDay && (targetMonth === null || labelMonth === targetMonth)) {
+        return i;
+      }
+    }
+  }
+
+  // 3. 曜日マッチ（「水曜」「水曜日」「水」）
+  const dayOfWeekMatch = input.match(/([月火水木金土])[曜日]?/);
+  if (dayOfWeekMatch) {
+    for (let i = 0; i < dateLabels.length; i++) {
+      if (dateLabels[i].includes(`(${dayOfWeekMatch[1]})`)) return i;
+    }
+  }
+
+  return null;
+}
+
 // ── ステップ2→3: 日付選択を受け取り、時間枠を返す ──
 
 export async function handleDateSelectionAndFindSlots(
   userText: string,
   history: { role: "user" | "assistant"; content: string }[],
 ): Promise<string | null> {
-  const match = userText.trim().match(/^[1-5１２３４５][番.\s]?$/);
-  if (!match) return null;
-
-  const numMap: Record<string, number> = {
-    "1": 1, "2": 2, "3": 3, "4": 4, "5": 5,
-    "１": 1, "２": 2, "３": 3, "４": 4, "５": 5,
-  };
-  const num = numMap[match[0][0]];
-  if (!num) return null;
-
   const lastBotMsg = [...history].reverse().find(
     (m) => m.role === "assistant" && m.content.includes("以下の日程から候補をお選びください"),
   );
   if (!lastBotMsg) return null;
 
-  const dateLabels = lastBotMsg.content.match(/\d+\.\s*(\d+\/\d+\([^\)]+\))/g);
-  if (!dateLabels || !dateLabels[num - 1]) return null;
+  const dateLabels = lastBotMsg.content.match(/\d+\.\s*\d+\/\d+\([^\)]+\)/g);
+  if (!dateLabels) return null;
 
-  const dateMatch = dateLabels[num - 1].match(/(\d+)\/(\d+)\(([^\)]+)\)/);
+  const selectedIndex = resolveSelectedDate(userText.trim(), dateLabels);
+  if (selectedIndex === null) return null;
+
+  const dateMatch = dateLabels[selectedIndex].match(/(\d+)\/(\d+)\(([^\)]+)\)/);
   if (!dateMatch) return null;
 
   const jst = getNowJst();
