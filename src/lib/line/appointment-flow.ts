@@ -17,6 +17,7 @@ import {
   createReservation,
   getNowJst,
   jstToUtc,
+  getJstPartsPublic,
 } from "@/lib/google/calendar";
 import { createAppointment } from "@/lib/db/queries/appointments";
 import { notifyFp } from "@/lib/notify/fp";
@@ -135,16 +136,40 @@ async function parsePreference(
     ? `\n\nこれまでの会話でユーザーが伝えた条件:\n${previousContext.map((c) => `- 「${c}」`).join("\n")}\n\n最新の発言: 「${userText}」\n\n最新の発言で追加・変更された条件は反映し、以前の条件（時間帯等）は明示的に変更されない限り引き継いでください。`
     : `\nユーザーの希望: 「${userText}」`;
 
+  // 「来週」「再来週」の正確な日付範囲を事前計算してAIに渡す
+  // 週の始まり=月曜（dayOfWeek: 1）
+  const daysUntilNextMonday = ((1 - jst.dayOfWeek + 7) % 7) || 7;
+  const nextMondayDay = jst.day + daysUntilNextMonday;
+  const nextSundayDay = nextMondayDay + 6;
+  const weekAfterMondayDay = nextMondayDay + 7;
+  const weekAfterSundayDay = weekAfterMondayDay + 6;
+
+  const nextMon = jstToUtc(jst.year, jst.month, nextMondayDay, 0);
+  const nextSun = jstToUtc(jst.year, jst.month, nextSundayDay, 0);
+  const nextMonJst = getJstPartsPublic(nextMon);
+  const nextSunJst = getJstPartsPublic(nextSun);
+
+  const weekAfterMon = jstToUtc(jst.year, jst.month, weekAfterMondayDay, 0);
+  const weekAfterSun = jstToUtc(jst.year, jst.month, weekAfterSundayDay, 0);
+  const weekAfterMonJst = getJstPartsPublic(weekAfterMon);
+  const weekAfterSunJst = getJstPartsPublic(weekAfterSun);
+
+  const weekReference = `
+「来週」= ${nextMonJst.month + 1}/${nextMonJst.day}(月)〜${nextSunJst.month + 1}/${nextSunJst.day}(日) （今日から${daysUntilNextMonday}日後の月曜から）
+「再来週」= ${weekAfterMonJst.month + 1}/${weekAfterMonJst.day}(月)〜${weekAfterSunJst.month + 1}/${weekAfterSunJst.day}(日)
+「今週」= 今日〜${nextMonJst.month + 1}/${nextMonJst.day - 1 > 0 ? nextMonJst.day - 1 : nextMonJst.day}(日)`;
+
   const prompt = `ユーザーの希望日時を解析してJSON形式で返してください。
 今日は${jst.year}年${jst.month + 1}月${jst.day}日（${WEEKDAYS[jst.dayOfWeek]}曜日）です。
+${weekReference}
 ${contextText}
 
 以下のJSON形式のみを返してください（説明不要）:
 {
-  "fromDaysOffset": 検索開始日（今日から何日後。0=今日、1=明日）,
-  "toDaysOffset": 検索終了日（今日から何日後。最大60）,
-  "hourStart": 希望開始時間（9-21の整数。「午後」なら12、「夕方」なら17、「19時以降」なら19。指定なしは9）,
-  "hourEnd": 希望終了時間（9-21の整数。「午前中」なら12、「午後」なら21。指定なしは21）,
+  "fromDaysOffset": 検索開始日（今日から何日後。0=今日、1=明日。「来週」なら${daysUntilNextMonday}）,
+  "toDaysOffset": 検索終了日（今日から何日後。最大60。「来週」なら${daysUntilNextMonday + 6}）,
+  "hourStart": 希望開始時間（9-21の整数。「午後」なら13、「夕方」なら17、「19時以降」なら19。指定なしは9）,
+  "hourEnd": 希望終了時間（9-21の整数。「午前中」なら12、「午後」なら18。指定なしは21）,
   "weekdaysOnly": 平日のみか（true/false。土日希望ならfalse）
 }`;
 
@@ -335,16 +360,18 @@ export async function handleDateSelectionAndFindSlots(
 別の日付を選ぶか、「相談予約」と送って最初からやり直せます。`;
     }
 
+    const maxSlots = Math.min(slots.length, 5);
     let text = `${dateMatch[1]}/${dateMatch[2]}(${dayOfWeekLabel}) の空き時間です。
 以下の時間帯からお選びください。
 番号でお答えください。
 
 `;
-    slots.forEach((s, i) => {
+    for (let i = 0; i < maxSlots; i++) {
+      const s = slots[i];
       const startH = s.label.match(/(\d+:\d+)〜/)?.[1] ?? "";
       const endH = s.label.match(/〜(\d+:\d+)/)?.[1] ?? "";
       text += `${i + 1}. ${startH}〜${endH}\n`;
-    });
+    }
 
     text += `
 他の日程をご希望の場合は、改めて希望をお知らせください。`;
@@ -367,7 +394,7 @@ function extractPreferredHoursFromHistory(
     const msg = history[i];
     if (msg.role === "user") {
       const text = msg.content;
-      if (text.includes("午後")) return { hourStart: 12, hourEnd: 21 };
+      if (text.includes("午後")) return { hourStart: 13, hourEnd: 18 };
       if (text.includes("午前")) return { hourStart: 9, hourEnd: 12 };
       if (text.includes("夕方")) return { hourStart: 17, hourEnd: 21 };
       if (text.includes("夜")) return { hourStart: 18, hourEnd: 21 };

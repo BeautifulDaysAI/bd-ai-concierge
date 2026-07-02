@@ -336,4 +336,4 @@ export function getNowJst(): { year: number; month: number; day: number; hour: n
 /**
  * JST日付指定からUTC Dateを生成（外部から利用）
  */
-export { jstToUtc };
+export { jstToUtc, getJstParts as getJstPartsPublic };
