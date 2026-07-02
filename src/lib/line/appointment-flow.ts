@@ -11,7 +11,7 @@
  */
 
 import { getAnthropicClient, getDefaultModel } from "@/lib/ai/client";
-import { findAvailableSlots, createReservation } from "@/lib/google/calendar";
+import { findAvailableSlots, createReservation, getNowJst, jstToUtc } from "@/lib/google/calendar";
 import { createAppointment } from "@/lib/db/queries/appointments";
 import { notifyFp } from "@/lib/notify/fp";
 
@@ -79,29 +79,61 @@ export function getAppointmentPromptMessage(): string {
 }
 
 /**
- * ユーザーの希望をAIでパースして日時制約に変換
+ * 予約セッション中のユーザーメッセージ履歴を抽出
+ * （条件継承のため、セッション内の全ユーザー発言を取得）
  */
-async function parsePreference(userText: string): Promise<{
+function extractReservationContext(
+  history: { role: "user" | "assistant"; content: string }[],
+): string[] {
+  const context: string[] = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.role === "assistant") {
+      if (msg.content.includes("予約が確定しました")) break;
+      if (msg.content.includes("予約の確定に失敗")) break;
+      if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) {
+        break;
+      }
+    }
+    if (msg.role === "user") {
+      context.unshift(msg.content);
+    }
+  }
+  return context;
+}
+
+/**
+ * ユーザーの希望をAIでパースして日時制約に変換
+ * 会話履歴から条件を引き継ぐ
+ */
+async function parsePreference(
+  userText: string,
+  history: { role: "user" | "assistant"; content: string }[],
+): Promise<{
   from: Date;
   to: Date;
   preferredHourStart: number;
   preferredHourEnd: number;
   weekdaysOnly: boolean;
 }> {
-  const now = new Date();
-  const jstNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+  const jst = getNowJst();
+  const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
+
+  const previousContext = extractReservationContext(history);
+  const contextText = previousContext.length > 0
+    ? `\n\nこれまでの会話でユーザーが伝えた条件:\n${previousContext.map((c) => `- 「${c}」`).join("\n")}\n\n最新の発言: 「${userText}」\n\n最新の発言で追加・変更された条件は反映し、以前の条件（時間帯等）は明示的に変更されない限り引き継いでください。`
+    : `\nユーザーの希望: 「${userText}」`;
 
   const prompt = `ユーザーの希望日時を解析してJSON形式で返してください。
-今日は${jstNow.getFullYear()}年${jstNow.getMonth() + 1}月${jstNow.getDate()}日（${["日", "月", "火", "水", "木", "金", "土"][jstNow.getDay()]}曜日）です。
-
-ユーザーの希望: "${userText}"
+今日は${jst.year}年${jst.month + 1}月${jst.day}日（${weekdays[jst.dayOfWeek]}曜日）です。
+${contextText}
 
 以下のJSON形式のみを返してください（説明不要）:
 {
   "fromDaysOffset": 検索開始日（今日から何日後。0=今日、1=明日）,
   "toDaysOffset": 検索終了日（今日から何日後。最大14）,
-  "hourStart": 希望開始時間（9-21の整数。指定なしは9）,
-  "hourEnd": 希望終了時間（9-21の整数。指定なしは21）,
+  "hourStart": 希望開始時間（9-21の整数。「午後」なら12、「夕方」なら17、「19時以降」なら19。指定なしは9）,
+  "hourEnd": 希望終了時間（9-21の整数。「午前中」なら12、「午後」なら21。指定なしは21）,
   "weekdaysOnly": 平日のみか（true/false。土日希望ならfalse）
 }`;
 
@@ -126,31 +158,28 @@ async function parsePreference(userText: string): Promise<{
       weekdaysOnly: boolean;
     };
 
-    const from = new Date(jstNow);
-    from.setDate(from.getDate() + Math.max(0, parsed.fromDaysOffset));
-    from.setHours(parsed.hourStart, 0, 0, 0);
+    console.log("[Reservation] パース結果:", parsed);
 
-    const to = new Date(jstNow);
-    to.setDate(to.getDate() + Math.min(14, parsed.toDaysOffset));
-    to.setHours(parsed.hourEnd, 0, 0, 0);
+    const hourStart = Math.max(9, Math.min(21, parsed.hourStart));
+    const hourEnd = Math.max(hourStart + 1, Math.min(21, parsed.hourEnd));
 
-    return {
-      from,
-      to,
-      preferredHourStart: Math.max(9, Math.min(21, parsed.hourStart)),
-      preferredHourEnd: Math.max(9, Math.min(21, parsed.hourEnd)),
-      weekdaysOnly: parsed.weekdaysOnly,
-    };
+    const from = jstToUtc(
+      jst.year, jst.month,
+      jst.day + Math.max(0, parsed.fromDaysOffset),
+      hourStart,
+    );
+
+    const to = jstToUtc(
+      jst.year, jst.month,
+      jst.day + Math.min(14, parsed.toDaysOffset),
+      hourEnd,
+    );
+
+    return { from, to, preferredHourStart: hourStart, preferredHourEnd: hourEnd, weekdaysOnly: parsed.weekdaysOnly };
   } catch (err) {
     console.warn("[Reservation] 希望パース失敗、デフォルト使用", err);
-    const from = new Date(jstNow);
-    from.setDate(from.getDate() + 1);
-    from.setHours(9, 0, 0, 0);
-
-    const to = new Date(jstNow);
-    to.setDate(to.getDate() + 14);
-    to.setHours(21, 0, 0, 0);
-
+    const from = jstToUtc(jst.year, jst.month, jst.day + 1, 9);
+    const to = jstToUtc(jst.year, jst.month, jst.day + 14, 21);
     return { from, to, preferredHourStart: 9, preferredHourEnd: 21, weekdaysOnly: true };
   }
 }
@@ -160,9 +189,10 @@ async function parsePreference(userText: string): Promise<{
  */
 export async function handlePreferenceAndFindSlots(
   userText: string,
+  history: { role: "user" | "assistant"; content: string }[],
 ): Promise<string> {
   try {
-    const constraints = await parsePreference(userText);
+    const constraints = await parsePreference(userText, history);
     const slots = await findAvailableSlots({
       ...constraints,
       maxResults: 3,
@@ -272,23 +302,22 @@ export async function tryConfirmAppointment(
 }
 
 /**
- * スロットラベル（例: "7/5(木) 19:00〜20:00"）をDateにパース
+ * スロットラベル（例: "7/5(木) 19:00〜20:00"）をUTC Dateにパース
  */
 function parseSlotLabel(label: string): Date | null {
   const match = label.match(/(\d+)\/(\d+)\(.+\)\s*(\d+):(\d+)/);
   if (!match) return null;
 
-  const now = new Date();
-  const year = now.getFullYear();
+  const jst = getNowJst();
+  let year = jst.year;
   const month = parseInt(match[1], 10) - 1;
   const day = parseInt(match[2], 10);
   const hour = parseInt(match[3], 10);
-  const minute = parseInt(match[4], 10);
 
-  const date = new Date(year, month, day, hour, minute, 0, 0);
+  const date = jstToUtc(year, month, day, hour);
 
-  if (date < now) {
-    date.setFullYear(year + 1);
+  if (date < new Date()) {
+    return jstToUtc(year + 1, month, day, hour);
   }
 
   return date;

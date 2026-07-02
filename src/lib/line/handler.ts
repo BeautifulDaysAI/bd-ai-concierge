@@ -101,7 +101,7 @@ async function handleMessage(event: MessageEvent): Promise<void> {
               });
               return;
             }
-            const slotsReply = await handlePreferenceAndFindSlots(userText);
+            const slotsReply = await handlePreferenceAndFindSlots(userText, history);
             await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
             await lineClient.replyMessage({
               replyToken,
@@ -111,7 +111,7 @@ async function handleMessage(event: MessageEvent): Promise<void> {
           }
 
           if (step === "ask_preference") {
-            const slotsReply = await handlePreferenceAndFindSlots(userText);
+            const slotsReply = await handlePreferenceAndFindSlots(userText, history);
             await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
             await lineClient.replyMessage({
               replyToken,

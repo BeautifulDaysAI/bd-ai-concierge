@@ -2,11 +2,14 @@
  * Google Calendar API クライアント
  *
  * 担当者カレンダーの空き時間検索・予約イベント追加
+ * すべてのDate操作はUTCで行い、JST変換は表示時のみ
  *
  * © Beautiful Days
  */
 
 import { google } from "googleapis";
+
+const JST_OFFSET_HOURS = 9;
 
 function getCalendarClient() {
   const auth = new google.auth.OAuth2(
@@ -28,6 +31,28 @@ export type TimeSlot = {
   end: Date;
   label: string;
 };
+
+/**
+ * JST時刻をUTC Dateとして生成
+ * 例: jstHour=14 → UTC 05:00 の Date
+ */
+function jstToUtc(year: number, month: number, day: number, hour: number): Date {
+  return new Date(Date.UTC(year, month, day, hour - JST_OFFSET_HOURS, 0, 0));
+}
+
+/**
+ * UTC DateからJSTの時間情報を取得
+ */
+function getJstParts(d: Date): { year: number; month: number; day: number; hour: number; dayOfWeek: number } {
+  const jst = new Date(d.getTime() + JST_OFFSET_HOURS * 60 * 60 * 1000);
+  return {
+    year: jst.getUTCFullYear(),
+    month: jst.getUTCMonth(),
+    day: jst.getUTCDate(),
+    hour: jst.getUTCHours(),
+    dayOfWeek: jst.getUTCDay(),
+  };
+}
 
 /**
  * 指定期間の空き1時間枠を検索
@@ -52,6 +77,14 @@ export async function findAvailableSlots(constraints: {
   const calendar = getCalendarClient();
   const calendarId = getCalendarId();
 
+  console.log("[Calendar] freeBusy検索", {
+    timeMin: from.toISOString(),
+    timeMax: to.toISOString(),
+    preferredHourStart,
+    preferredHourEnd,
+    weekdaysOnly,
+  });
+
   const freeBusyRes = await calendar.freebusy.query({
     requestBody: {
       timeMin: from.toISOString(),
@@ -63,58 +96,70 @@ export async function findAvailableSlots(constraints: {
 
   const busySlots = freeBusyRes.data.calendars?.[calendarId]?.busy ?? [];
 
+  console.log("[Calendar] busy件数:", busySlots.length);
+  busySlots.forEach((b) => {
+    console.log("[Calendar] busy:", b.start, "〜", b.end);
+  });
+
   const busyRanges = busySlots.map((b) => ({
     start: new Date(b.start!),
     end: new Date(b.end!),
   }));
 
   const candidates: TimeSlot[] = [];
-  const current = new Date(from);
-  current.setMinutes(0, 0, 0);
+  const now = new Date();
 
-  while (current < to && candidates.length < maxResults) {
-    const dayOfWeek = current.getDay();
+  const fromJst = getJstParts(from);
+  let currentUtc = jstToUtc(fromJst.year, fromJst.month, fromJst.day, preferredHourStart);
 
-    if (weekdaysOnly && (dayOfWeek === 0 || dayOfWeek === 6)) {
-      current.setDate(current.getDate() + 1);
-      current.setHours(preferredHourStart, 0, 0, 0);
+  if (currentUtc < from) {
+    currentUtc = new Date(from);
+    const cJst = getJstParts(currentUtc);
+    if (cJst.hour < preferredHourStart) {
+      currentUtc = jstToUtc(cJst.year, cJst.month, cJst.day, preferredHourStart);
+    }
+  }
+
+  while (currentUtc < to && candidates.length < maxResults) {
+    const jst = getJstParts(currentUtc);
+
+    if (weekdaysOnly && (jst.dayOfWeek === 0 || jst.dayOfWeek === 6)) {
+      currentUtc = jstToUtc(jst.year, jst.month, jst.day + 1, preferredHourStart);
       continue;
     }
 
-    const hour = current.getHours();
-    if (hour < preferredHourStart) {
-      current.setHours(preferredHourStart, 0, 0, 0);
+    if (jst.hour < preferredHourStart) {
+      currentUtc = jstToUtc(jst.year, jst.month, jst.day, preferredHourStart);
       continue;
     }
-    if (hour >= preferredHourEnd) {
-      current.setDate(current.getDate() + 1);
-      current.setHours(preferredHourStart, 0, 0, 0);
-      continue;
-    }
-
-    if (current < new Date()) {
-      current.setHours(current.getHours() + 1);
+    if (jst.hour >= preferredHourEnd) {
+      currentUtc = jstToUtc(jst.year, jst.month, jst.day + 1, preferredHourStart);
       continue;
     }
 
-    const slotEnd = new Date(current);
-    slotEnd.setHours(slotEnd.getHours() + 1);
+    if (currentUtc <= now) {
+      currentUtc = new Date(currentUtc.getTime() + 60 * 60 * 1000);
+      continue;
+    }
+
+    const slotEndUtc = new Date(currentUtc.getTime() + 60 * 60 * 1000);
 
     const isOverlapping = busyRanges.some(
-      (busy) => current < busy.end && slotEnd > busy.start,
+      (busy) => currentUtc < busy.end && slotEndUtc > busy.start,
     );
 
     if (!isOverlapping) {
       candidates.push({
-        start: new Date(current),
-        end: new Date(slotEnd),
-        label: formatSlotLabel(current),
+        start: new Date(currentUtc),
+        end: new Date(slotEndUtc),
+        label: formatSlotLabelJst(currentUtc),
       });
     }
 
-    current.setHours(current.getHours() + 1);
+    currentUtc = new Date(currentUtc.getTime() + 60 * 60 * 1000);
   }
 
+  console.log("[Calendar] 候補数:", candidates.length);
   return candidates;
 }
 
@@ -128,8 +173,7 @@ export async function createReservation(
   const calendar = getCalendarClient();
   const calendarId = getCalendarId();
 
-  const end = new Date(start);
-  end.setHours(end.getHours() + 1);
+  const end = new Date(start.getTime() + 60 * 60 * 1000);
 
   try {
     const event = await calendar.events.insert({
@@ -155,11 +199,25 @@ export async function createReservation(
   }
 }
 
-function formatSlotLabel(date: Date): string {
-  const month = date.getMonth() + 1;
-  const day = date.getDate();
+/**
+ * UTC DateをJST表示ラベルに変換
+ */
+function formatSlotLabelJst(utcDate: Date): string {
+  const jst = getJstParts(utcDate);
   const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
-  const weekday = weekdays[date.getDay()];
-  const hour = date.getHours().toString().padStart(2, "0");
-  return `${month}/${day}(${weekday}) ${hour}:00〜${(date.getHours() + 1).toString().padStart(2, "0")}:00`;
+  const hour = jst.hour.toString().padStart(2, "0");
+  const nextHour = (jst.hour + 1).toString().padStart(2, "0");
+  return `${jst.month + 1}/${jst.day}(${weekdays[jst.dayOfWeek]}) ${hour}:00〜${nextHour}:00`;
 }
+
+/**
+ * 現在のJST日時情報を返す（AIパース用）
+ */
+export function getNowJst(): { year: number; month: number; day: number; hour: number; dayOfWeek: number } {
+  return getJstParts(new Date());
+}
+
+/**
+ * JST日付指定からUTC Dateを生成（外部から利用）
+ */
+export { jstToUtc };
