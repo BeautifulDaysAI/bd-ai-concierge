@@ -1,6 +1,8 @@
 /**
  * LINE イベントハンドラ（アポ獲得特化版）
  *
+ * 予約フロー: ask_preference → show_dates → show_times → 確定
+ *
  * © Beautiful Days
  */
 
@@ -21,7 +23,8 @@ import {
   isInReservationSession,
   getReservationStep,
   getAppointmentPromptMessage,
-  handlePreferenceAndFindSlots,
+  handlePreferenceAndFindDates,
+  handleDateSelectionAndFindSlots,
   tryConfirmAppointment,
 } from "./appointment-flow";
 
@@ -73,7 +76,6 @@ async function handleMessage(event: MessageEvent): Promise<void> {
           return;
         }
 
-        // ユーザー入力を保存
         await saveMessage({
           memberId: member.id,
           direction: "in",
@@ -82,11 +84,12 @@ async function handleMessage(event: MessageEvent): Promise<void> {
 
         const history = await getRecentMessages(member.id, 10);
 
-        // 1. 予約セッション中の処理
+        // 1. 予約セッション中の処理（3段階フロー）
         if (isInReservationSession(history)) {
           const step = getReservationStep(history);
 
-          if (step === "show_slots") {
+          // show_times → 番号で時間選択 → 予約確定
+          if (step === "show_times") {
             const confirmReply = await tryConfirmAppointment(
               userText,
               member.id,
@@ -101,21 +104,44 @@ async function handleMessage(event: MessageEvent): Promise<void> {
               });
               return;
             }
-            const slotsReply = await handlePreferenceAndFindSlots(userText, history);
-            await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
+            // 番号以外 → 希望し直し → 日付候補を再提示
+            const datesReply = await handlePreferenceAndFindDates(userText, history);
+            await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
             await lineClient.replyMessage({
               replyToken,
-              messages: [{ type: "text", text: slotsReply }],
+              messages: [{ type: "text", text: datesReply }],
             });
             return;
           }
 
-          if (step === "ask_preference") {
-            const slotsReply = await handlePreferenceAndFindSlots(userText, history);
-            await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
+          // show_dates → 番号で日付選択 → 時間枠提示
+          if (step === "show_dates") {
+            const slotsReply = await handleDateSelectionAndFindSlots(userText, history);
+            if (slotsReply) {
+              await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
+              await lineClient.replyMessage({
+                replyToken,
+                messages: [{ type: "text", text: slotsReply }],
+              });
+              return;
+            }
+            // 番号以外 → 希望し直し → 日付候補を再提示
+            const datesReply = await handlePreferenceAndFindDates(userText, history);
+            await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
             await lineClient.replyMessage({
               replyToken,
-              messages: [{ type: "text", text: slotsReply }],
+              messages: [{ type: "text", text: datesReply }],
+            });
+            return;
+          }
+
+          // ask_preference → 希望パース → 日付候補提示
+          if (step === "ask_preference") {
+            const datesReply = await handlePreferenceAndFindDates(userText, history);
+            await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
+            await lineClient.replyMessage({
+              replyToken,
+              messages: [{ type: "text", text: datesReply }],
             });
             return;
           }

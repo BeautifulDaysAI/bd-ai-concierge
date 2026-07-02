@@ -1,19 +1,33 @@
 /**
- * 相談予約フロー（Google Calendar連携版）
+ * 相談予約フロー（Google Calendar連携・3段階版）
  *
  * フロー：
- * 1. 「相談予約」検出 → 希望日時を質問
- * 2. 希望をAIがパース → Google Calendar空き時間検索
- * 3. 候補3つ提示
- * 4. 番号選択 → Googleカレンダーにイベント追加 → DB保存 → FP通知
+ * 1. 「相談予約」検出 → 希望日時を質問 (ask_preference)
+ * 2. 希望をAIがパース → 日付候補を提示 (show_dates)
+ * 3. 日付を番号選択 → その日の時間枠を提示 (show_times)
+ * 4. 時間を番号選択 → Googleカレンダーにイベント追加 → DB保存 → FP通知
  *
  * © Beautiful Days
  */
 
 import { getAnthropicClient, getDefaultModel } from "@/lib/ai/client";
-import { findAvailableSlots, createReservation, getNowJst, jstToUtc } from "@/lib/google/calendar";
+import {
+  findAvailableDates,
+  findAvailableSlotsOnDate,
+  createReservation,
+  getNowJst,
+  jstToUtc,
+} from "@/lib/google/calendar";
 import { createAppointment } from "@/lib/db/queries/appointments";
 import { notifyFp } from "@/lib/notify/fp";
+
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+
+export type ReservationStep =
+  | "ask_preference"
+  | "show_dates"
+  | "show_times"
+  | "none";
 
 /**
  * 「相談予約」キーワード検出
@@ -42,7 +56,8 @@ export function isInReservationSession(
       if (msg.content.includes("予約が確定しました")) return false;
       if (msg.content.includes("予約の確定に失敗")) return false;
       if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) return true;
-      if (msg.content.includes("以下の候補からご都合のよい日時")) return true;
+      if (msg.content.includes("以下の日程から候補をお選びください")) return true;
+      if (msg.content.includes("以下の時間帯からお選びください")) return true;
     }
   }
   return false;
@@ -53,13 +68,14 @@ export function isInReservationSession(
  */
 export function getReservationStep(
   history: { role: "user" | "assistant"; content: string }[],
-): "ask_preference" | "show_slots" | "none" {
+): ReservationStep {
   for (let i = history.length - 1; i >= 0; i--) {
     const msg = history[i];
     if (msg.role === "assistant") {
       if (msg.content.includes("予約が確定しました")) return "none";
       if (msg.content.includes("予約の確定に失敗")) return "none";
-      if (msg.content.includes("以下の候補からご都合のよい日時")) return "show_slots";
+      if (msg.content.includes("以下の時間帯からお選びください")) return "show_times";
+      if (msg.content.includes("以下の日程から候補をお選びください")) return "show_dates";
       if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) return "ask_preference";
     }
   }
@@ -75,12 +91,11 @@ export function getAppointmentPromptMessage(): string {
 ご希望の曜日・時間帯を教えてください。
 （例：来週の平日19時以降、今週木曜の午後、いつでもOK）
 
-担当者のカレンダーから空き時間をお探しします。`;
+担当者のカレンダーから空き日程をお探しします。`;
 }
 
 /**
  * 予約セッション中のユーザーメッセージ履歴を抽出
- * （条件継承のため、セッション内の全ユーザー発言を取得）
  */
 function extractReservationContext(
   history: { role: "user" | "assistant"; content: string }[],
@@ -91,9 +106,7 @@ function extractReservationContext(
     if (msg.role === "assistant") {
       if (msg.content.includes("予約が確定しました")) break;
       if (msg.content.includes("予約の確定に失敗")) break;
-      if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) {
-        break;
-      }
+      if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) break;
     }
     if (msg.role === "user") {
       context.unshift(msg.content);
@@ -104,7 +117,6 @@ function extractReservationContext(
 
 /**
  * ユーザーの希望をAIでパースして日時制約に変換
- * 会話履歴から条件を引き継ぐ
  */
 async function parsePreference(
   userText: string,
@@ -117,7 +129,6 @@ async function parsePreference(
   weekdaysOnly: boolean;
 }> {
   const jst = getNowJst();
-  const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
 
   const previousContext = extractReservationContext(history);
   const contextText = previousContext.length > 0
@@ -125,13 +136,13 @@ async function parsePreference(
     : `\nユーザーの希望: 「${userText}」`;
 
   const prompt = `ユーザーの希望日時を解析してJSON形式で返してください。
-今日は${jst.year}年${jst.month + 1}月${jst.day}日（${weekdays[jst.dayOfWeek]}曜日）です。
+今日は${jst.year}年${jst.month + 1}月${jst.day}日（${WEEKDAYS[jst.dayOfWeek]}曜日）です。
 ${contextText}
 
 以下のJSON形式のみを返してください（説明不要）:
 {
   "fromDaysOffset": 検索開始日（今日から何日後。0=今日、1=明日）,
-  "toDaysOffset": 検索終了日（今日から何日後。最大14）,
+  "toDaysOffset": 検索終了日（今日から何日後。最大60）,
   "hourStart": 希望開始時間（9-21の整数。「午後」なら12、「夕方」なら17、「19時以降」なら19。指定なしは9）,
   "hourEnd": 希望終了時間（9-21の整数。「午前中」なら12、「午後」なら21。指定なしは21）,
   "weekdaysOnly": 平日のみか（true/false。土日希望ならfalse）
@@ -171,7 +182,7 @@ ${contextText}
 
     const to = jstToUtc(
       jst.year, jst.month,
-      jst.day + Math.min(14, parsed.toDaysOffset),
+      jst.day + Math.min(60, parsed.toDaysOffset),
       hourEnd,
     );
 
@@ -184,33 +195,117 @@ ${contextText}
   }
 }
 
-/**
- * 希望を受け取り、空き時間候補を返す
- */
-export async function handlePreferenceAndFindSlots(
+// ── ステップ1→2: 希望を受け取り、日付候補を返す ──
+
+export async function handlePreferenceAndFindDates(
   userText: string,
   history: { role: "user" | "assistant"; content: string }[],
 ): Promise<string> {
   try {
     const constraints = await parsePreference(userText, history);
-    const slots = await findAvailableSlots({
-      ...constraints,
-      maxResults: 3,
+    const dates = findAvailableDates({
+      from: constraints.from,
+      to: constraints.to,
+      weekdaysOnly: constraints.weekdaysOnly,
     });
 
-    if (slots.length === 0) {
-      return `申し訳ありません、ご希望の条件では空き枠が見つかりませんでした。
+    if (dates.length === 0) {
+      return `申し訳ありません、ご希望の条件では候補日が見つかりませんでした。
 
 別の日程や時間帯でご希望があればお知らせください。
-（例：来週の平日、土日でもOK、午前中希望）`;
+（例：来週の平日、土曜も可、再来週あたり）`;
     }
 
-    let text = `以下の候補からご都合のよい日時をお選びください。
+    const maxDates = Math.min(dates.length, 5);
+    let text = `以下の日程から候補をお選びください。
+番号でお答えください。
+
+`;
+    for (let i = 0; i < maxDates; i++) {
+      const d = dates[i];
+      const dayLabel = `${d.month + 1}/${d.day}(${WEEKDAYS[d.dayOfWeek]})`;
+      const hours = d.dayOfWeek === 6 ? "10:00〜18:00" : "9:00〜21:00";
+      text += `${i + 1}. ${dayLabel}  ${hours}\n`;
+    }
+
+    text += `
+他の日程をご希望の場合は、改めて希望をお知らせください。`;
+
+    return text;
+  } catch (err) {
+    console.error("[Reservation] 日付検索エラー", err);
+    return `申し訳ありません、カレンダーの確認中にエラーが発生しました。
+少し時間をおいて再度「相談予約」とお送りください。`;
+  }
+}
+
+// ── ステップ2→3: 日付選択を受け取り、時間枠を返す ──
+
+export async function handleDateSelectionAndFindSlots(
+  userText: string,
+  history: { role: "user" | "assistant"; content: string }[],
+): Promise<string | null> {
+  const match = userText.trim().match(/^[1-5１２３４５][番.\s]?$/);
+  if (!match) return null;
+
+  const numMap: Record<string, number> = {
+    "1": 1, "2": 2, "3": 3, "4": 4, "5": 5,
+    "１": 1, "２": 2, "３": 3, "４": 4, "５": 5,
+  };
+  const num = numMap[match[0][0]];
+  if (!num) return null;
+
+  const lastBotMsg = [...history].reverse().find(
+    (m) => m.role === "assistant" && m.content.includes("以下の日程から候補をお選びください"),
+  );
+  if (!lastBotMsg) return null;
+
+  const dateLabels = lastBotMsg.content.match(/\d+\.\s*(\d+\/\d+\([^\)]+\))/g);
+  if (!dateLabels || !dateLabels[num - 1]) return null;
+
+  const dateMatch = dateLabels[num - 1].match(/(\d+)\/(\d+)\(([^\)]+)\)/);
+  if (!dateMatch) return null;
+
+  const jst = getNowJst();
+  let year = jst.year;
+  const month = parseInt(dateMatch[1], 10) - 1;
+  const day = parseInt(dateMatch[2], 10);
+  const dayOfWeekLabel = dateMatch[3];
+
+  if (month < jst.month || (month === jst.month && day < jst.day)) {
+    year += 1;
+  }
+
+  const dayOfWeek = WEEKDAYS.indexOf(dayOfWeekLabel);
+
+  const schedule = dayOfWeek === 6
+    ? { open: 10, close: 18, lastStart: 17 }
+    : { open: 9, close: 21, lastStart: 20 };
+
+  const preferredConstraints = extractPreferredHoursFromHistory(history);
+
+  try {
+    const slots = await findAvailableSlotsOnDate(
+      year, month, day, schedule,
+      preferredConstraints.hourStart,
+      preferredConstraints.hourEnd,
+    );
+
+    if (slots.length === 0) {
+      return `申し訳ありません、${dateMatch[1]}/${dateMatch[2]}(${dayOfWeekLabel}) は空き枠がありませんでした。
+
+別の日付を選ぶか、「相談予約」と送って最初からやり直せます。`;
+    }
+
+    let text = `${dateMatch[1]}/${dateMatch[2]}(${dayOfWeekLabel}) の空き時間です。
+以下の時間帯からお選びください。
 番号でお答えください。
 
 `;
     slots.forEach((s, i) => {
-      text += `${i + 1}. ${s.label}\n`;
+      const startH = s.label.match(/(\d+:\d+)〜/)?.[1] ?? "";
+      const endH = s.label.match(/〜(\d+:\d+)/)?.[1] ?? "";
+      text += `${i + 1}. ${startH}〜${endH}\n`;
     });
 
     text += `
@@ -218,15 +313,41 @@ export async function handlePreferenceAndFindSlots(
 
     return text;
   } catch (err) {
-    console.error("[Reservation] 空き時間検索エラー", err);
+    console.error("[Reservation] 時間枠検索エラー", err);
     return `申し訳ありません、カレンダーの確認中にエラーが発生しました。
 少し時間をおいて再度「相談予約」とお送りください。`;
   }
 }
 
 /**
- * 番号選択から候補をパースし、予約を確定
+ * 会話履歴から希望時間帯を抽出（AIパース結果の再利用はできないので簡易判定）
  */
+function extractPreferredHoursFromHistory(
+  history: { role: "user" | "assistant"; content: string }[],
+): { hourStart?: number; hourEnd?: number } {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.role === "user") {
+      const text = msg.content;
+      if (text.includes("午後")) return { hourStart: 12, hourEnd: 21 };
+      if (text.includes("午前")) return { hourStart: 9, hourEnd: 12 };
+      if (text.includes("夕方")) return { hourStart: 17, hourEnd: 21 };
+      if (text.includes("夜")) return { hourStart: 18, hourEnd: 21 };
+      if (text.includes("朝")) return { hourStart: 9, hourEnd: 12 };
+      const hourMatch = text.match(/(\d{1,2})時以降/);
+      if (hourMatch) return { hourStart: parseInt(hourMatch[1], 10) };
+      const hourMatch2 = text.match(/(\d{1,2})時まで/);
+      if (hourMatch2) return { hourEnd: parseInt(hourMatch2[1], 10) };
+    }
+    if (msg.role === "assistant" && msg.content.includes("ご希望の曜日・時間帯を教えてください")) {
+      break;
+    }
+  }
+  return {};
+}
+
+// ── ステップ3→確定: 時間選択から予約確定 ──
+
 export async function tryConfirmAppointment(
   userText: string,
   memberId: string,
@@ -234,29 +355,29 @@ export async function tryConfirmAppointment(
   history: { role: "user" | "assistant"; content: string }[],
 ): Promise<string | null> {
   const step = getReservationStep(history);
-  if (step !== "show_slots") return null;
+  if (step !== "show_times") return null;
 
-  const match = userText.trim().match(/^[123１２３][番.\s]?$/);
+  const match = userText.trim().match(/^(\d{1,2})[番.\s]?$/);
   if (!match) return null;
 
-  const numMap: Record<string, number> = {
-    "1": 1, "2": 2, "3": 3,
-    "１": 1, "２": 2, "３": 3,
-  };
-  const num = numMap[match[0][0]];
-  if (!num) return null;
+  const num = parseInt(match[1], 10);
+  if (num < 1) return null;
 
   const lastBotMsg = [...history].reverse().find(
-    (m) => m.role === "assistant" && m.content.includes("以下の候補からご都合のよい日時"),
+    (m) => m.role === "assistant" && m.content.includes("以下の時間帯からお選びください"),
   );
   if (!lastBotMsg) return null;
 
-  const slotLabels = lastBotMsg.content.match(/\d+\. .+/g);
-  if (!slotLabels || !slotLabels[num - 1]) return null;
+  const dateHeader = lastBotMsg.content.match(/^(\d+\/\d+\([^\)]+\))/);
+  if (!dateHeader) return null;
 
-  const selectedLabel = slotLabels[num - 1].replace(/^\d+\.\s*/, "");
+  const timeLabels = lastBotMsg.content.match(/\d+\.\s*(\d+:\d+〜\d+:\d+)/g);
+  if (!timeLabels || !timeLabels[num - 1]) return null;
 
-  const parsed = parseSlotLabel(selectedLabel);
+  const selectedTime = timeLabels[num - 1].replace(/^\d+\.\s*/, "");
+  const fullLabel = `${dateHeader[1]} ${selectedTime}`;
+
+  const parsed = parseSlotLabel(fullLabel);
   if (!parsed) {
     return "申し訳ありません、日時の解析に失敗しました。改めて「相談予約」とお送りください。";
   }
@@ -281,7 +402,7 @@ export async function tryConfirmAppointment(
     type: "fp_appointment",
     memberName,
     memberId,
-    summary: `相談予約：${selectedLabel}`,
+    summary: `相談予約：${fullLabel}`,
     details: {
       scheduled_at: parsed.toISOString(),
       google_event_id: calResult.eventId,
@@ -292,7 +413,7 @@ export async function tryConfirmAppointment(
   return `予約が確定しました。
 
 ▼ ご予約内容
-日時：${selectedLabel}
+日時：${fullLabel}
 所要時間：約1時間
 
 担当者から改めてご連絡します。
