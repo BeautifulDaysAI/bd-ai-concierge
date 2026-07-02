@@ -224,8 +224,7 @@ export async function handlePreferenceAndFindDates(
     for (let i = 0; i < maxDates; i++) {
       const d = dates[i];
       const dayLabel = `${d.month + 1}/${d.day}(${WEEKDAYS[d.dayOfWeek]})`;
-      const hours = d.dayOfWeek === 6 ? "10:00〜18:00" : "9:00〜21:00";
-      text += `${i + 1}. ${dayLabel}  ${hours}\n`;
+      text += `${i + 1}. ${dayLabel}\n`;
     }
 
     text += `

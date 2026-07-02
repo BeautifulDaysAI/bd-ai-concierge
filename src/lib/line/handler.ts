@@ -84,7 +84,18 @@ async function handleMessage(event: MessageEvent): Promise<void> {
 
         const history = await getRecentMessages(member.id, 10);
 
-        // 1. 予約セッション中の処理（3段階フロー）
+        // 1. 「相談予約」検出 → フロー（再）開始（セッション判定より先に評価）
+        if (isAppointmentRequest(userText)) {
+          const promptMsg = getAppointmentPromptMessage();
+          await saveMessage({ memberId: member.id, direction: "out", content: promptMsg });
+          await lineClient.replyMessage({
+            replyToken,
+            messages: [{ type: "text", text: promptMsg }],
+          });
+          return;
+        }
+
+        // 2. 予約セッション中の処理（3段階フロー）
         if (isInReservationSession(history)) {
           const step = getReservationStep(history);
 
@@ -145,17 +156,6 @@ async function handleMessage(event: MessageEvent): Promise<void> {
             });
             return;
           }
-        }
-
-        // 2. 「相談予約」検出 → フロー開始
-        if (isAppointmentRequest(userText)) {
-          const promptMsg = getAppointmentPromptMessage();
-          await saveMessage({ memberId: member.id, direction: "out", content: promptMsg });
-          await lineClient.replyMessage({
-            replyToken,
-            messages: [{ type: "text", text: promptMsg }],
-          });
-          return;
         }
 
         // 3. それ以外は AI 応答（respond.ts内でsaveMessage済み）
