@@ -24,6 +24,47 @@ import { notifyFp } from "@/lib/notify/fp";
 
 const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
 
+/**
+ * テキストから曜日を検出（口語対応）
+ * 返り値: 0(日)〜6(土)、検出なしはnull
+ */
+function detectDayOfWeek(text: string): number | null {
+  const patterns: [RegExp, number][] = [
+    [/日曜/, 0],
+    [/月曜/, 1],
+    [/火曜/, 2],
+    [/水曜/, 3],
+    [/木曜/, 4],
+    [/金曜/, 5],
+    [/土曜/, 6],
+  ];
+  for (const [regex, dow] of patterns) {
+    if (regex.test(text)) return dow;
+  }
+  return null;
+}
+
+/**
+ * 会話履歴からも曜日指定を検出
+ */
+function detectDayOfWeekFromHistory(
+  currentText: string,
+  history: { role: "user" | "assistant"; content: string }[],
+): number | null {
+  const fromCurrent = detectDayOfWeek(currentText);
+  if (fromCurrent !== null) return fromCurrent;
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.role === "assistant" && msg.content.includes("ご希望の曜日・時間帯を教えてください")) break;
+    if (msg.role === "user") {
+      const detected = detectDayOfWeek(msg.content);
+      if (detected !== null) return detected;
+    }
+  }
+  return null;
+}
+
 export type ReservationStep =
   | "ask_preference"
   | "show_dates"
@@ -57,6 +98,7 @@ export function isInReservationSession(
       if (msg.content.includes("予約が確定しました")) return false;
       if (msg.content.includes("予約の確定に失敗")) return false;
       if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) return true;
+      if (msg.content.includes("ご希望の曜日・時間帯をお知らせください")) return true;
       if (msg.content.includes("以下の日程から候補をお選びください")) return true;
       if (msg.content.includes("以下の時間帯からお選びください")) return true;
     }
@@ -78,6 +120,7 @@ export function getReservationStep(
       if (msg.content.includes("以下の時間帯からお選びください")) return "show_times";
       if (msg.content.includes("以下の日程から候補をお選びください")) return "show_dates";
       if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) return "ask_preference";
+      if (msg.content.includes("ご希望の曜日・時間帯をお知らせください")) return "ask_preference";
     }
   }
   return "none";
@@ -128,6 +171,7 @@ async function parsePreference(
   preferredHourStart: number;
   preferredHourEnd: number;
   weekdaysOnly: boolean;
+  targetDayOfWeek?: number;
 }> {
   const jst = getNowJst();
 
@@ -167,10 +211,11 @@ ${contextText}
 以下のJSON形式のみを返してください（説明不要）:
 {
   "fromDaysOffset": 検索開始日（今日から何日後。0=今日、1=明日。「来週」なら${daysUntilNextMonday}）,
-  "toDaysOffset": 検索終了日（今日から何日後。最大60。「来週」なら${daysUntilNextMonday + 6}）,
+  "toDaysOffset": 検索終了日（今日から何日後。最大60。「来週」なら${daysUntilNextMonday + 6}。曜日指定のみで時期指定なしなら28）,
   "hourStart": 希望開始時間（9-21の整数。「午後」なら13、「夕方」なら17、「19時以降」なら19。指定なしは9）,
   "hourEnd": 希望終了時間（9-21の整数。「午前中」なら12、「午後」なら18。指定なしは21）,
-  "weekdaysOnly": 平日のみか（true/false。土日希望ならfalse）
+  "weekdaysOnly": 平日のみか（true/false。土日希望や曜日指定ありならfalse）,
+  "dayOfWeek": 特定曜日指定（0=日,1=月,2=火,3=水,4=木,5=金,6=土。指定なしはnull。「土曜」なら6、「月曜」なら1）
 }`;
 
   try {
@@ -192,12 +237,23 @@ ${contextText}
       hourStart: number;
       hourEnd: number;
       weekdaysOnly: boolean;
+      dayOfWeek: number | null;
     };
 
     console.log("[Reservation] パース結果:", parsed);
 
     const hourStart = Math.max(9, Math.min(21, parsed.hourStart));
     const hourEnd = Math.max(hourStart + 1, Math.min(21, parsed.hourEnd));
+
+    // 曜日指定がある場合、口語検出結果を優先（AI誤判定防止）
+    const detectedDow = detectDayOfWeekFromHistory(userText, history);
+    const targetDayOfWeek = detectedDow ?? (parsed.dayOfWeek !== null ? parsed.dayOfWeek : undefined);
+
+    // 曜日指定時は検索範囲を広げる（最低28日）
+    let toDaysOffset = Math.min(60, parsed.toDaysOffset);
+    if (targetDayOfWeek !== undefined && toDaysOffset < 28) {
+      toDaysOffset = 28;
+    }
 
     const from = jstToUtc(
       jst.year, jst.month,
@@ -207,16 +263,17 @@ ${contextText}
 
     const to = jstToUtc(
       jst.year, jst.month,
-      jst.day + Math.min(60, parsed.toDaysOffset),
+      jst.day + toDaysOffset,
       hourEnd,
     );
 
-    return { from, to, preferredHourStart: hourStart, preferredHourEnd: hourEnd, weekdaysOnly: parsed.weekdaysOnly };
+    return { from, to, preferredHourStart: hourStart, preferredHourEnd: hourEnd, weekdaysOnly: parsed.weekdaysOnly, targetDayOfWeek };
   } catch (err) {
     console.warn("[Reservation] 希望パース失敗、デフォルト使用", err);
+    const detectedDow = detectDayOfWeekFromHistory(userText, history);
     const from = jstToUtc(jst.year, jst.month, jst.day + 1, 9);
-    const to = jstToUtc(jst.year, jst.month, jst.day + 14, 21);
-    return { from, to, preferredHourStart: 9, preferredHourEnd: 21, weekdaysOnly: true };
+    const to = jstToUtc(jst.year, jst.month, jst.day + (detectedDow !== null ? 28 : 14), 21);
+    return { from, to, preferredHourStart: 9, preferredHourEnd: 21, weekdaysOnly: detectedDow === null, targetDayOfWeek: detectedDow ?? undefined };
   }
 }
 
@@ -226,12 +283,31 @@ export async function handlePreferenceAndFindDates(
   userText: string,
   history: { role: "user" | "assistant"; content: string }[],
 ): Promise<string> {
+  // 日曜指定の即時応答
+  const explicitDow = detectDayOfWeekFromHistory(userText, history);
+  if (explicitDow === 0) {
+    return `申し訳ありません、日曜日は予約不可となっております。
+
+平日（月〜金）または土曜日でご検討ください。
+ご希望の曜日・時間帯をお知らせください。`;
+  }
+
   try {
     const constraints = await parsePreference(userText, history);
+
+    // parsePreferenceでも日曜が返った場合のガード
+    if (constraints.targetDayOfWeek === 0) {
+      return `申し訳ありません、日曜日は予約不可となっております。
+
+平日（月〜金）または土曜日でご検討ください。
+ご希望の曜日・時間帯をお知らせください。`;
+    }
+
     const dates = findAvailableDates({
       from: constraints.from,
       to: constraints.to,
       weekdaysOnly: constraints.weekdaysOnly,
+      targetDayOfWeek: constraints.targetDayOfWeek,
     });
 
     if (dates.length === 0) {

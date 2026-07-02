@@ -129,8 +129,9 @@ export function findAvailableDates(constraints: {
   from: Date;
   to: Date;
   weekdaysOnly?: boolean;
+  targetDayOfWeek?: number;
 }): Array<{ year: number; month: number; day: number; dayOfWeek: number; schedule: DaySchedule }> {
-  const { from, to, weekdaysOnly = false } = constraints;
+  const { from, to, weekdaysOnly = false, targetDayOfWeek } = constraints;
 
   const now = new Date();
   const earliest = new Date(now.getTime() + MIN_ADVANCE_HOURS * 60 * 60 * 1000);
@@ -152,6 +153,10 @@ export function findAvailableDates(constraints: {
 
     if (schedule) {
       if (weekdaysOnly && jst.dayOfWeek === 6) {
+        cursor = jstToUtc(jst.year, jst.month, jst.day + 1, 0);
+        continue;
+      }
+      if (targetDayOfWeek !== undefined && jst.dayOfWeek !== targetDayOfWeek) {
         cursor = jstToUtc(jst.year, jst.month, jst.day + 1, 0);
         continue;
       }
