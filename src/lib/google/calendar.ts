@@ -4,12 +4,57 @@
  * 担当者カレンダーの空き時間検索・予約イベント追加
  * すべてのDate操作はUTCで行い、JST変換は表示時のみ
  *
+ * 営業時間ルール:
+ *   平日(月〜金) 9:00-21:00（最終開始20:00）
+ *   土曜        10:00-18:00（最終開始17:00）
+ *   日曜・祝日   予約不可
+ *   昼休憩      12:00-13:00 除外
+ *   直前予約     24時間以内は不可
+ *   遠方予約     60日以上先は不可
+ *
  * © Beautiful Days
  */
 
 import { google } from "googleapis";
 
 const JST_OFFSET_HOURS = 9;
+const MIN_ADVANCE_HOURS = 24;
+const MAX_ADVANCE_DAYS = 60;
+
+type DaySchedule = {
+  open: number;
+  close: number;
+  lastStart: number;
+};
+
+const WEEKDAY_SCHEDULE: DaySchedule = { open: 9, close: 21, lastStart: 20 };
+const SATURDAY_SCHEDULE: DaySchedule = { open: 10, close: 18, lastStart: 17 };
+
+const LUNCH_START = 12;
+const LUNCH_END = 13;
+
+/**
+ * 日本の祝日（2026-2027年）
+ * 年末に翌々年分を追加すること
+ */
+const JAPANESE_HOLIDAYS: Set<string> = new Set([
+  // 2026
+  "2026-01-01", "2026-01-12", "2026-02-11", "2026-02-23",
+  "2026-03-20", "2026-04-29", "2026-05-03", "2026-05-04",
+  "2026-05-05", "2026-05-06", "2026-07-20", "2026-08-11",
+  "2026-09-21", "2026-09-22", "2026-09-23", "2026-10-12",
+  "2026-11-03", "2026-11-23", "2026-12-23",
+  // 2027
+  "2027-01-01", "2027-01-11", "2027-02-11", "2027-02-23",
+  "2027-03-21", "2027-04-29", "2027-05-03", "2027-05-04",
+  "2027-05-05", "2027-07-19", "2027-08-11", "2027-09-20",
+  "2027-09-23", "2027-10-11", "2027-11-03", "2027-11-23",
+]);
+
+function isJapaneseHoliday(year: number, month: number, day: number): boolean {
+  const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return JAPANESE_HOLIDAYS.has(key);
+}
 
 function getCalendarClient() {
   const auth = new google.auth.OAuth2(
@@ -34,7 +79,6 @@ export type TimeSlot = {
 
 /**
  * JST時刻をUTC Dateとして生成
- * 例: jstHour=14 → UTC 05:00 の Date
  */
 function jstToUtc(year: number, month: number, day: number, hour: number): Date {
   return new Date(Date.UTC(year, month, day, hour - JST_OFFSET_HOURS, 0, 0));
@@ -55,7 +99,139 @@ function getJstParts(d: Date): { year: number; month: number; day: number; hour:
 }
 
 /**
- * 指定期間の空き1時間枠を検索
+ * 指定日JSTの営業スケジュールを返す。予約不可の日はnull
+ */
+function getDaySchedule(year: number, month: number, day: number, dayOfWeek: number): DaySchedule | null {
+  if (dayOfWeek === 0) return null;
+  if (isJapaneseHoliday(year, month, day)) return null;
+  if (dayOfWeek === 6) return SATURDAY_SCHEDULE;
+  return WEEKDAY_SCHEDULE;
+}
+
+/**
+ * 指定日に提示可能な時間枠の開始時刻一覧を返す（JST時）
+ * 昼休憩(12:00-13:00)を除外
+ */
+function getBusinessHours(schedule: DaySchedule): number[] {
+  const hours: number[] = [];
+  for (let h = schedule.open; h <= schedule.lastStart; h++) {
+    if (h >= LUNCH_START && h < LUNCH_END) continue;
+    hours.push(h);
+  }
+  return hours;
+}
+
+/**
+ * 予約候補を出せる日付一覧を返す（JST）
+ * 直前24h以内と60日以上先を除外
+ */
+export function findAvailableDates(constraints: {
+  from: Date;
+  to: Date;
+  weekdaysOnly?: boolean;
+}): Array<{ year: number; month: number; day: number; dayOfWeek: number; schedule: DaySchedule }> {
+  const { from, to, weekdaysOnly = false } = constraints;
+
+  const now = new Date();
+  const earliest = new Date(now.getTime() + MIN_ADVANCE_HOURS * 60 * 60 * 1000);
+  const latest = new Date(now.getTime() + MAX_ADVANCE_DAYS * 24 * 60 * 60 * 1000);
+
+  const effectiveFrom = from > earliest ? from : earliest;
+  const effectiveTo = to < latest ? to : latest;
+
+  if (effectiveFrom >= effectiveTo) return [];
+
+  const dates: Array<{ year: number; month: number; day: number; dayOfWeek: number; schedule: DaySchedule }> = [];
+
+  const startJst = getJstParts(effectiveFrom);
+  let cursor = jstToUtc(startJst.year, startJst.month, startJst.day, 0);
+
+  while (cursor < effectiveTo) {
+    const jst = getJstParts(cursor);
+    const schedule = getDaySchedule(jst.year, jst.month, jst.day, jst.dayOfWeek);
+
+    if (schedule) {
+      if (weekdaysOnly && jst.dayOfWeek === 6) {
+        cursor = jstToUtc(jst.year, jst.month, jst.day + 1, 0);
+        continue;
+      }
+      dates.push({ year: jst.year, month: jst.month, day: jst.day, dayOfWeek: jst.dayOfWeek, schedule });
+    }
+
+    cursor = jstToUtc(jst.year, jst.month, jst.day + 1, 0);
+  }
+
+  return dates;
+}
+
+/**
+ * 特定日のfreeBusyを取得し、空き1時間枠を返す
+ */
+export async function findAvailableSlotsOnDate(
+  year: number,
+  month: number,
+  day: number,
+  schedule: DaySchedule,
+  preferredHourStart?: number,
+  preferredHourEnd?: number,
+): Promise<TimeSlot[]> {
+  const calendar = getCalendarClient();
+  const calendarId = getCalendarId();
+
+  const dayStart = jstToUtc(year, month, day, schedule.open);
+  const dayEnd = jstToUtc(year, month, day, schedule.close);
+
+  const freeBusyRes = await calendar.freebusy.query({
+    requestBody: {
+      timeMin: dayStart.toISOString(),
+      timeMax: dayEnd.toISOString(),
+      timeZone: "Asia/Tokyo",
+      items: [{ id: calendarId }],
+    },
+  });
+
+  const busySlots = freeBusyRes.data.calendars?.[calendarId]?.busy ?? [];
+  const busyRanges = busySlots.map((b) => ({
+    start: new Date(b.start!),
+    end: new Date(b.end!),
+  }));
+
+  const now = new Date();
+  const earliest = new Date(now.getTime() + MIN_ADVANCE_HOURS * 60 * 60 * 1000);
+  const hours = getBusinessHours(schedule);
+
+  const effectiveStart = preferredHourStart ?? schedule.open;
+  const effectiveEnd = preferredHourEnd ?? schedule.close;
+
+  const slots: TimeSlot[] = [];
+
+  for (const h of hours) {
+    if (h < effectiveStart || h >= effectiveEnd) continue;
+
+    const slotStart = jstToUtc(year, month, day, h);
+    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
+
+    if (slotStart < earliest) continue;
+
+    const isOverlapping = busyRanges.some(
+      (busy) => slotStart < busy.end && slotEnd > busy.start,
+    );
+    if (isOverlapping) continue;
+
+    slots.push({
+      start: new Date(slotStart),
+      end: new Date(slotEnd),
+      label: formatSlotLabelJst(slotStart),
+    });
+  }
+
+  return slots;
+}
+
+/**
+ * 指定期間の空き1時間枠を検索（メインAPI）
+ *
+ * 営業時間・昼休憩・祝日・24h制限・60日制限を厳格適用
  */
 export async function findAvailableSlots(constraints: {
   from: Date;
@@ -68,99 +244,39 @@ export async function findAvailableSlots(constraints: {
   const {
     from,
     to,
-    preferredHourStart = 9,
-    preferredHourEnd = 21,
+    preferredHourStart,
+    preferredHourEnd,
     weekdaysOnly = true,
     maxResults = 3,
   } = constraints;
 
-  const calendar = getCalendarClient();
-  const calendarId = getCalendarId();
-
-  console.log("[Calendar] freeBusy検索", {
-    timeMin: from.toISOString(),
-    timeMax: to.toISOString(),
+  console.log("[Calendar] 空き検索開始", {
+    from: from.toISOString(),
+    to: to.toISOString(),
     preferredHourStart,
     preferredHourEnd,
     weekdaysOnly,
   });
 
-  const freeBusyRes = await calendar.freebusy.query({
-    requestBody: {
-      timeMin: from.toISOString(),
-      timeMax: to.toISOString(),
-      timeZone: "Asia/Tokyo",
-      items: [{ id: calendarId }],
-    },
-  });
+  const dates = findAvailableDates({ from, to, weekdaysOnly });
+  console.log("[Calendar] 候補日数:", dates.length);
 
-  const busySlots = freeBusyRes.data.calendars?.[calendarId]?.busy ?? [];
+  const allSlots: TimeSlot[] = [];
 
-  console.log("[Calendar] busy件数:", busySlots.length);
-  busySlots.forEach((b) => {
-    console.log("[Calendar] busy:", b.start, "〜", b.end);
-  });
+  for (const date of dates) {
+    if (allSlots.length >= maxResults) break;
 
-  const busyRanges = busySlots.map((b) => ({
-    start: new Date(b.start!),
-    end: new Date(b.end!),
-  }));
-
-  const candidates: TimeSlot[] = [];
-  const now = new Date();
-
-  const fromJst = getJstParts(from);
-  let currentUtc = jstToUtc(fromJst.year, fromJst.month, fromJst.day, preferredHourStart);
-
-  if (currentUtc < from) {
-    currentUtc = new Date(from);
-    const cJst = getJstParts(currentUtc);
-    if (cJst.hour < preferredHourStart) {
-      currentUtc = jstToUtc(cJst.year, cJst.month, cJst.day, preferredHourStart);
-    }
-  }
-
-  while (currentUtc < to && candidates.length < maxResults) {
-    const jst = getJstParts(currentUtc);
-
-    if (weekdaysOnly && (jst.dayOfWeek === 0 || jst.dayOfWeek === 6)) {
-      currentUtc = jstToUtc(jst.year, jst.month, jst.day + 1, preferredHourStart);
-      continue;
-    }
-
-    if (jst.hour < preferredHourStart) {
-      currentUtc = jstToUtc(jst.year, jst.month, jst.day, preferredHourStart);
-      continue;
-    }
-    if (jst.hour >= preferredHourEnd) {
-      currentUtc = jstToUtc(jst.year, jst.month, jst.day + 1, preferredHourStart);
-      continue;
-    }
-
-    if (currentUtc <= now) {
-      currentUtc = new Date(currentUtc.getTime() + 60 * 60 * 1000);
-      continue;
-    }
-
-    const slotEndUtc = new Date(currentUtc.getTime() + 60 * 60 * 1000);
-
-    const isOverlapping = busyRanges.some(
-      (busy) => currentUtc < busy.end && slotEndUtc > busy.start,
+    const remaining = maxResults - allSlots.length;
+    const daySlots = await findAvailableSlotsOnDate(
+      date.year, date.month, date.day, date.schedule,
+      preferredHourStart, preferredHourEnd,
     );
 
-    if (!isOverlapping) {
-      candidates.push({
-        start: new Date(currentUtc),
-        end: new Date(slotEndUtc),
-        label: formatSlotLabelJst(currentUtc),
-      });
-    }
-
-    currentUtc = new Date(currentUtc.getTime() + 60 * 60 * 1000);
+    allSlots.push(...daySlots.slice(0, remaining));
   }
 
-  console.log("[Calendar] 候補数:", candidates.length);
-  return candidates;
+  console.log("[Calendar] 最終候補数:", allSlots.length);
+  return allSlots;
 }
 
 /**
