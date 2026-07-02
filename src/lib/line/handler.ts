@@ -26,6 +26,11 @@ import {
   handlePreferenceAndFindDates,
   handleDateSelectionAndFindSlots,
   tryConfirmAppointment,
+  isBusinessDayQuestion,
+  isGeneralQuestion,
+  answerInterruptionQuestion,
+  BUSINESS_DAY_POLICY,
+  FLOW_CONTINUE_PROMPT,
 } from "./appointment-flow";
 
 export async function handleLineEvent(event: WebhookEvent): Promise<void> {
@@ -115,7 +120,19 @@ async function handleMessage(event: MessageEvent): Promise<void> {
               });
               return;
             }
-            // 番号以外 → 希望し直し → 日付候補を再提示
+            // 番号以外 → 割り込み質問の3段階判定
+            if (isBusinessDayQuestion(userText)) {
+              await saveMessage({ memberId: member.id, direction: "out", content: BUSINESS_DAY_POLICY });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: BUSINESS_DAY_POLICY }] });
+              return;
+            }
+            if (isGeneralQuestion(userText)) {
+              const answer = await answerInterruptionQuestion(userText, history);
+              const reply = answer + FLOW_CONTINUE_PROMPT;
+              await saveMessage({ memberId: member.id, direction: "out", content: reply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: reply }] });
+              return;
+            }
             const datesReply = await handlePreferenceAndFindDates(userText, history);
             await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
             await lineClient.replyMessage({
@@ -136,7 +153,19 @@ async function handleMessage(event: MessageEvent): Promise<void> {
               });
               return;
             }
-            // 番号以外 → 希望し直し → 日付候補を再提示
+            // 番号以外 → 割り込み質問の3段階判定
+            if (isBusinessDayQuestion(userText)) {
+              await saveMessage({ memberId: member.id, direction: "out", content: BUSINESS_DAY_POLICY });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: BUSINESS_DAY_POLICY }] });
+              return;
+            }
+            if (isGeneralQuestion(userText)) {
+              const answer = await answerInterruptionQuestion(userText, history);
+              const reply = answer + FLOW_CONTINUE_PROMPT;
+              await saveMessage({ memberId: member.id, direction: "out", content: reply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: reply }] });
+              return;
+            }
             const datesReply = await handlePreferenceAndFindDates(userText, history);
             await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
             await lineClient.replyMessage({

@@ -21,6 +21,8 @@ import {
 } from "@/lib/google/calendar";
 import { createAppointment } from "@/lib/db/queries/appointments";
 import { notifyFp } from "@/lib/notify/fp";
+import { searchFaq, formatFaqForPrompt } from "@/lib/ai/knowledge/faq";
+import { SYSTEM_PROMPT } from "@/lib/ai/prompts/system";
 
 const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
 
@@ -65,6 +67,47 @@ function detectDayOfWeekFromHistory(
   return null;
 }
 
+// ── 割り込み質問の検出 ──
+
+const BUSINESS_DAY_KEYWORDS = /土日|週末|土曜|日曜|平日|休み|やって(い|な)|営業|祝日/;
+const QUESTION_INDICATORS = /？|\?|ですか|でしょうか|ありますか|いますか|なの|かな|って|けど|のは|どう/;
+
+export function isBusinessDayQuestion(text: string): boolean {
+  return BUSINESS_DAY_KEYWORDS.test(text);
+}
+
+export function isGeneralQuestion(text: string): boolean {
+  return QUESTION_INDICATORS.test(text);
+}
+
+export const BUSINESS_DAY_POLICY = `ご相談は月〜土で承っております（日曜はお休みです）。
+上記の候補からご希望の番号をお選びください。`;
+
+export const FLOW_CONTINUE_PROMPT = "\n\n引き続き、上記の候補から番号でお選びください。";
+
+export async function answerInterruptionQuestion(
+  userText: string,
+  history: { role: "user" | "assistant"; content: string }[],
+): Promise<string> {
+  const relevantFaqs = searchFaq(userText, 3);
+  const faqContext = formatFaqForPrompt(relevantFaqs);
+  const systemWithFaq = faqContext ? `${SYSTEM_PROMPT}\n\n${faqContext}` : SYSTEM_PROMPT;
+
+  try {
+    const result = await getAnthropicClient().messages.create({
+      model: getDefaultModel(),
+      max_tokens: 512,
+      system: `${systemWithFaq}\n\n現在、ユーザーは相談予約の日程選択中です。質問に簡潔に回答してください。予約フローの案内（日程リストの再提示など）は不要です。`,
+      messages: [...history.slice(-6), { role: "user", content: userText }],
+    });
+    const content = result.content[0];
+    if (content.type === "text") return content.text;
+  } catch (err) {
+    console.error("[Reservation] 割り込み質問応答エラー", err);
+  }
+  return "申し訳ありません、回答を生成できませんでした。";
+}
+
 export type ReservationStep =
   | "ask_preference"
   | "show_dates"
@@ -101,6 +144,8 @@ export function isInReservationSession(
       if (msg.content.includes("ご希望の曜日・時間帯をお知らせください")) return true;
       if (msg.content.includes("以下の日程から候補をお選びください")) return true;
       if (msg.content.includes("以下の時間帯からお選びください")) return true;
+      if (msg.content.includes("上記の候補からご希望の番号をお選びください")) return true;
+      if (msg.content.includes("上記の候補から番号でお選びください")) return true;
     }
   }
   return false;
@@ -121,6 +166,9 @@ export function getReservationStep(
       if (msg.content.includes("以下の日程から候補をお選びください")) return "show_dates";
       if (msg.content.includes("ご希望の曜日・時間帯を教えてください")) return "ask_preference";
       if (msg.content.includes("ご希望の曜日・時間帯をお知らせください")) return "ask_preference";
+      // 割り込み質問への応答はスキップして前のステップを探す
+      if (msg.content.includes("上記の候補からご希望の番号をお選びください")) continue;
+      if (msg.content.includes("上記の候補から番号でお選びください")) continue;
     }
   }
   return "none";
