@@ -1,8 +1,8 @@
 /**
  * FP への通知サービス
  *
- * Slack Webhook、または メール経由でFPに通知。
- * ADMIN_WEBHOOK_URL が設定されていれば Slack 形式で送信。
+ * ADMIN_WEBHOOK_URL が設定されていれば Slack で通知。
+ * 予約確定・キャンセルの即時通知はLINE push（@/lib/notify/line）を別途使用。
  *
  * © Beautiful Days
  */
@@ -46,7 +46,7 @@ const TYPE_LABEL: Record<NotifyType, string> = {
 };
 
 /**
- * FP に通知を送る
+ * FP に通知を送る（Slack Webhook設定時のみ）
  */
 export async function notifyFp(payload: NotifyPayload): Promise<void> {
   const webhookUrl = process.env.ADMIN_WEBHOOK_URL;

@@ -151,6 +151,8 @@ CREATE TABLE IF NOT EXISTS fp_appointments (
   fp_name TEXT,
   notes TEXT,            -- FP記入欄
   google_event_id TEXT,  -- Google Calendar イベントID（キャンセル時に使用）
+  reminder_sent_at TIMESTAMPTZ,  -- 前日リマインドメール送信済み日時
+  contact_info TEXT,     -- 当日連絡用の電話番号/メールアドレス
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

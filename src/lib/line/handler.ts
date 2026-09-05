@@ -28,12 +28,10 @@ import {
   handlePreferenceAndFindDates,
   handleDateSelectionAndFindSlots,
   tryConfirmAppointment,
-  isDayOfWeekPreference,
-  isBusinessDayQuestion,
-  isGeneralQuestion,
+  tryFinalizeAppointmentWithContact,
+  classifyAndParseInput,
   answerInterruptionQuestion,
   BUSINESS_DAY_POLICY,
-  SUNDAY_REJECTION_IN_FLOW,
   FLOW_CONTINUE_PROMPT,
 } from "./appointment-flow";
 
@@ -107,7 +105,76 @@ async function handleMessage(event: MessageEvent): Promise<void> {
           return;
         }
 
-        // 1. 「相談予約」検出 → フロー（再）開始（セッション判定より先に評価）
+        // 0.5. 連絡先（電話番号/メールアドレス）回答の受付 → 予約確定
+        const contactReply = await tryFinalizeAppointmentWithContact(
+          userText, member.id, member.displayName ?? "会員様", history,
+        );
+        if (contactReply) {
+          await saveMessage({ memberId: member.id, direction: "out", content: contactReply });
+          await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: contactReply }] });
+          return;
+        }
+
+        // 1. 予約セッション中の処理（3段階フロー）
+        //    セッション中は「予約したい」等を含む日時指定もLLM分類で処理するため、
+        //    isAppointmentRequest より先に評価する
+        if (isInReservationSession(history)) {
+          const step = getReservationStep(history);
+
+          // show_times: 番号選択→予約確定を先に試行
+          if (step === "show_times") {
+            const confirmReply = await tryConfirmAppointment(
+              userText, member.id, member.displayName ?? "会員様", history,
+            );
+            if (confirmReply) {
+              await saveMessage({ memberId: member.id, direction: "out", content: confirmReply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: confirmReply }] });
+              return;
+            }
+          }
+
+          // show_dates: 番号/日付/曜日での選択を先に試行
+          if (step === "show_dates") {
+            const slotsReply = await handleDateSelectionAndFindSlots(userText, history);
+            if (slotsReply) {
+              await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: slotsReply }] });
+              return;
+            }
+          }
+
+          // 全ステップ共通: LLMで意図分類→分岐
+          if (step === "show_times" || step === "show_dates" || step === "ask_preference") {
+            const parsed = await classifyAndParseInput(userText, history);
+
+            if (parsed.intent === "business_hours_question") {
+              const reply = step === "ask_preference"
+                ? BUSINESS_DAY_POLICY + "\n\nご希望の曜日・時間帯をお知らせください。"
+                : BUSINESS_DAY_POLICY;
+              await saveMessage({ memberId: member.id, direction: "out", content: reply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: reply }] });
+              return;
+            }
+
+            if (parsed.intent === "other_question") {
+              const answer = await answerInterruptionQuestion(userText, history);
+              const reply = step === "ask_preference"
+                ? answer + "\n\nご希望の曜日・時間帯をお知らせください。"
+                : answer + FLOW_CONTINUE_PROMPT;
+              await saveMessage({ memberId: member.id, direction: "out", content: reply });
+              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: reply }] });
+              return;
+            }
+
+            // date_time_request → 日付候補検索
+            const datesReply = await handlePreferenceAndFindDates(userText, history, parsed);
+            await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
+            await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: datesReply }] });
+            return;
+          }
+        }
+
+        // 2. 「相談予約」検出 → フロー開始（セッション外のみ）
         if (isAppointmentRequest(userText)) {
           const promptMsg = getAppointmentPromptMessage();
           await saveMessage({ memberId: member.id, direction: "out", content: promptMsg });
@@ -116,117 +183,6 @@ async function handleMessage(event: MessageEvent): Promise<void> {
             messages: [{ type: "text", text: promptMsg }],
           });
           return;
-        }
-
-        // 2. 予約セッション中の処理（3段階フロー）
-        if (isInReservationSession(history)) {
-          const step = getReservationStep(history);
-
-          // show_times → 番号で時間選択 → 予約確定
-          if (step === "show_times") {
-            const confirmReply = await tryConfirmAppointment(
-              userText,
-              member.id,
-              member.displayName ?? "会員様",
-              history,
-            );
-            if (confirmReply) {
-              await saveMessage({ memberId: member.id, direction: "out", content: confirmReply });
-              await lineClient.replyMessage({
-                replyToken,
-                messages: [{ type: "text", text: confirmReply }],
-              });
-              return;
-            }
-            // 番号以外 → 割り込み4段階判定
-            const timePref = isDayOfWeekPreference(userText);
-            if (timePref.match) {
-              if (timePref.isSunday) {
-                await saveMessage({ memberId: member.id, direction: "out", content: SUNDAY_REJECTION_IN_FLOW });
-                await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: SUNDAY_REJECTION_IN_FLOW }] });
-                return;
-              }
-              const datesReply = await handlePreferenceAndFindDates(userText, history);
-              await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
-              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: datesReply }] });
-              return;
-            }
-            if (isBusinessDayQuestion(userText)) {
-              await saveMessage({ memberId: member.id, direction: "out", content: BUSINESS_DAY_POLICY });
-              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: BUSINESS_DAY_POLICY }] });
-              return;
-            }
-            if (isGeneralQuestion(userText)) {
-              const answer = await answerInterruptionQuestion(userText, history);
-              const reply = answer + FLOW_CONTINUE_PROMPT;
-              await saveMessage({ memberId: member.id, direction: "out", content: reply });
-              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: reply }] });
-              return;
-            }
-            const datesReply = await handlePreferenceAndFindDates(userText, history);
-            await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
-            await lineClient.replyMessage({
-              replyToken,
-              messages: [{ type: "text", text: datesReply }],
-            });
-            return;
-          }
-
-          // show_dates → 番号で日付選択 → 時間枠提示
-          if (step === "show_dates") {
-            const slotsReply = await handleDateSelectionAndFindSlots(userText, history);
-            if (slotsReply) {
-              await saveMessage({ memberId: member.id, direction: "out", content: slotsReply });
-              await lineClient.replyMessage({
-                replyToken,
-                messages: [{ type: "text", text: slotsReply }],
-              });
-              return;
-            }
-            // 番号以外 → 割り込み4段階判定
-            const datesPref = isDayOfWeekPreference(userText);
-            if (datesPref.match) {
-              if (datesPref.isSunday) {
-                await saveMessage({ memberId: member.id, direction: "out", content: SUNDAY_REJECTION_IN_FLOW });
-                await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: SUNDAY_REJECTION_IN_FLOW }] });
-                return;
-              }
-              const newDatesReply = await handlePreferenceAndFindDates(userText, history);
-              await saveMessage({ memberId: member.id, direction: "out", content: newDatesReply });
-              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: newDatesReply }] });
-              return;
-            }
-            if (isBusinessDayQuestion(userText)) {
-              await saveMessage({ memberId: member.id, direction: "out", content: BUSINESS_DAY_POLICY });
-              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: BUSINESS_DAY_POLICY }] });
-              return;
-            }
-            if (isGeneralQuestion(userText)) {
-              const answer = await answerInterruptionQuestion(userText, history);
-              const reply = answer + FLOW_CONTINUE_PROMPT;
-              await saveMessage({ memberId: member.id, direction: "out", content: reply });
-              await lineClient.replyMessage({ replyToken, messages: [{ type: "text", text: reply }] });
-              return;
-            }
-            const datesReply = await handlePreferenceAndFindDates(userText, history);
-            await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
-            await lineClient.replyMessage({
-              replyToken,
-              messages: [{ type: "text", text: datesReply }],
-            });
-            return;
-          }
-
-          // ask_preference → 希望パース → 日付候補提示
-          if (step === "ask_preference") {
-            const datesReply = await handlePreferenceAndFindDates(userText, history);
-            await saveMessage({ memberId: member.id, direction: "out", content: datesReply });
-            await lineClient.replyMessage({
-              replyToken,
-              messages: [{ type: "text", text: datesReply }],
-            });
-            return;
-          }
         }
 
         // 3. それ以外は AI 応答（respond.ts内でsaveMessage済み）

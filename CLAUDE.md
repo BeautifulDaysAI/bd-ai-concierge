@@ -45,6 +45,10 @@ AIは以下を**絶対にやらない**：
 | アポ前ヒアリング・課題整理 | AIだけで相談を完結させること |
 | FP向け事前ブリーフィング | 「絶対」「必ず」などの断定表現 |
 | 市況情報のドラフト生成（人間チェック前提） | 人間チェックなしの情報配信 |
+| 性格タイプ診断・ライフプラン診断（自己理解の参考） | 診断結果を根拠にした商品推奨・売買判断 |
+| 診断完了時の家計サンプル画像の送付 | 会員の家計画像・証券の内容解析 |
+| Google Calendar 連携での相談枠の提示・予約・キャンセル | 予約枠の裏で行う個別商品の提案・契約 |
+| 代表者／創業者など会社情報のFAQ即答 | 事実確認できない人物・実績の創作 |
 
 ### 全配信物に「人間チェック」を必須化
 
@@ -78,6 +82,37 @@ Lv.3（10%）FP直行ゾーン
   - 高額（500万超）の運用判断
   → 即アポ誘導
 ```
+
+---
+
+## 主な会員向け機能（実装済み・アポ獲得特化版）
+
+`src/lib/ai/respond.ts` / `src/lib/line/handler.ts` を中核に、以下が動いている。
+
+### 診断（自己理解の入口・アポ誘導）
+
+- **3分ライフプラン診断（7問）**：`DIAGNOSTIC_PROMPT`。7問すべて回答後に「気づきシート」を返す。
+- **30秒お金診断（5問・性格タイプ判定）**：`MONEY_DIAGNOSTIC_PROMPT`。5問の回答から4つのお金の性格タイプのいずれかを判定。
+- 診断は「自己理解の参考」であり「商品の推奨ではない」ことをプロンプト側で明記させている。
+- 診断モードは3段階フィルターのレベル分類より前に分岐するが、**共通ガードは効いている**：
+  - 入力は `detectProductName()` による個別商品名検出の対象（検出時は Lv.3 強制でFP直行）
+  - 診断の応答テキストは出力時に `checkNgWords()`（NGワードガード）を通し、NG検出時は `SAFE_FALLBACK_RESPONSE` に差し替え
+
+### 家計サンプル画像の送信
+
+- ライフプラン診断が完了（気づきシート到達）すると、`handler.ts` が LINE の image メッセージで家計支出のサンプル画像を添付する（`HOUSEHOLD_IMAGE_URL` の固定・静的サンプル。会員個人の画像ではない）。
+- 画像に先立つ診断テキストは上記NGワードガードを通過済み。
+
+### Google Calendar 連携の相談予約フロー
+
+- `src/lib/google/calendar.ts`（freeBusy 検索・予約作成・イベント削除）と `src/lib/line/appointment-flow.ts` で構成。
+- 予約は3段階フロー：`ask_preference`（希望聴取）→ `show_dates`（日付候補提示）→ `show_times`（時間候補提示）→ 連絡先受付で確定。確定時に `google_event_id` を保存。
+- 「キャンセル」でカレンダーイベント削除まで実行。予約フロー中の割り込み質問にも応答して復帰する。
+- 曜日フィルタ・日曜予約不可・昼休憩・祝日・24h/60日制限など営業時間ルールを厳格化。
+
+### 会社情報FAQ（代表者／創業者を分離）
+
+- `src/lib/ai/knowledge/faq.ts`。「代表者は誰か」と「創業者は誰か」を別FAQに分離し、代表取締役＝岡 竜一、創業者＝真武（またけ）と正確に返す。
 
 ---
 
@@ -144,45 +179,54 @@ bd-ai-concierge/
 │   ├── lib/
 │   │   ├── ai/
 │   │   │   ├── client.ts               # Anthropic SDKクライアント
+│   │   │   ├── respond.ts              # 応答生成の中核（診断/3段階分岐）
+│   │   │   ├── morning-brief.ts        # 市況ドラフト生成
 │   │   │   ├── prompts/
-│   │   │   │   ├── system.ts           # システムプロンプト本体
-│   │   │   │   ├── filter.ts           # 3段階フィルター判定
-│   │   │   │   └── hearing.ts          # 事前ヒアリング
-│   │   │   └── guards/
-│   │   │       ├── ng-words.ts         # 禁止ワードフィルター
-│   │   │       └── disclaimer.ts       # 免責文言自動付与
+│   │   │   │   └── system.ts           # SYSTEM_PROMPT / FILTER_PROMPT / DIAGNOSTIC_PROMPT / MONEY_DIAGNOSTIC_PROMPT
+│   │   │   ├── guards/
+│   │   │   │   └── ng-words.ts         # NGワード/個別商品名/契約意図の検出
+│   │   │   └── knowledge/
+│   │   │       └── faq.ts              # AIが参照するBD独自FAQ
 │   │   │
 │   │   ├── line/
 │   │   │   ├── client.ts               # LINE SDK
-│   │   │   ├── reply.ts                # 応答送信
+│   │   │   ├── handler.ts              # Webhookイベント処理・予約フロー分岐
+│   │   │   ├── appointment-flow.ts     # 相談予約3段階フロー
+│   │   │   ├── document-intake.ts      # 資料お預かり受付
 │   │   │   └── signature.ts            # Webhook署名検証
+│   │   │
+│   │   ├── google/
+│   │   │   └── calendar.ts             # Google Calendar連携（freeBusy/予約/削除）
+│   │   │
+│   │   ├── notify/
+│   │   │   ├── fp.ts                    # FPへの通知
+│   │   │   └── line.ts                  # LINEプッシュ通知
 │   │   │
 │   │   ├── db/
 │   │   │   ├── supabase.ts             # Supabaseクライアント
+│   │   │   ├── supabase-server.ts      # Server Component用
+│   │   │   ├── supabase-browser.ts     # Browser用
 │   │   │   └── queries/
 │   │   │       ├── members.ts
 │   │   │       ├── messages.ts
-│   │   │       └── documents.ts
+│   │   │       ├── appointments.ts
+│   │   │       ├── events.ts
+│   │   │       ├── delivery.ts
+│   │   │       └── morning-briefs.ts
 │   │   │
 │   │   └── utils/
-│   │       ├── logger.ts               # ログ（全会話を保存）
 │   │       └── env.ts                  # 環境変数バリデーション
 │   │
-│   └── types/
-│       ├── line.ts
-│       ├── member.ts
-│       └── ai.ts
+│   └── middleware.ts                   # /admin 配下の認証保護
 │
-├── docs/
-│   ├── system-prompt.md                # システムプロンプト設計書
-│   ├── ng-words.md                     # NGワード一覧
-│   ├── faq-knowledge.md                # AIが参照するFAQ
-│   └── operations.md                   # 運用手順書
-│
-└── scripts/
-    ├── seed-faq.ts                     # FAQ初期データ投入
-    └── test-filter.ts                  # フィルター判定テスト
+└── docs/
+    ├── system-prompt.md                # システムプロンプト設計書
+    ├── week1-setup.md 〜 week4-guide.md # 週次実装ガイド
+    ├── deployment.md                   # Vercelデプロイガイド
+    └── operations.md                   # 運用手順書
 ```
+
+※ NGワードは `src/lib/ai/guards/ng-words.ts`、FAQは `src/lib/ai/knowledge/faq.ts` がソース・オブ・トゥルース。`docs/ng-words.md`・`docs/faq-knowledge.md`・`scripts/` は存在しない（過去案の名残）。
 
 ---
 
@@ -340,4 +384,4 @@ Beautiful Days の世界観に合わせる：
 
 ---
 
-最終更新：2026年5月
+最終更新：2026年7月12日（実装同期）

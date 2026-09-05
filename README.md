@@ -110,7 +110,7 @@ npm install -g vercel
 vercel
 ```
 
-詳細は `docs/deployment.md`（後日作成）参照。
+詳細は `docs/deployment.md` 参照。
 
 ---
 
@@ -126,8 +126,8 @@ vercel
 
 - `CLAUDE.md` - プロジェクト全体のコンテキスト（Claude Code向け）
 - `docs/system-prompt.md` - AI システムプロンプト設計
-- `docs/ng-words.md` - NG ワード一覧
-- `docs/faq-knowledge.md` - AI が参照する FAQ
+- `src/lib/ai/guards/ng-words.ts` - NG ワード一覧（実装ソース）
+- `src/lib/ai/knowledge/faq.ts` - AI が参照する FAQ（実装ソース）
 - `docs/operations.md` - 運用手順書
 
 ---

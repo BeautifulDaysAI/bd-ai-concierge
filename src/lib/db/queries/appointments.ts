@@ -22,7 +22,14 @@ export type FpAppointment = {
   fpName: string | null;
   notes: string | null;
   googleEventId: string | null;
+  reminderSentAt: string | null;
+  contactInfo: string | null;
   createdAt: string;
+};
+
+export type AppointmentWithMember = FpAppointment & {
+  memberLineUserId: string | null;
+  memberDisplayName: string | null;
 };
 
 /**
@@ -35,6 +42,7 @@ export async function createAppointment(input: {
   hearingSummary?: string;
   fpName?: string;
   googleEventId?: string;
+  contactInfo?: string;
 }): Promise<FpAppointment | null> {
   const { data, error } = await supabaseAdmin
     .from("fp_appointments")
@@ -45,6 +53,7 @@ export async function createAppointment(input: {
       hearing_summary: input.hearingSummary ?? null,
       fp_name: input.fpName ?? null,
       google_event_id: input.googleEventId ?? null,
+      contact_info: input.contactInfo ?? null,
       status: "scheduled",
     })
     .select()
@@ -55,6 +64,7 @@ export async function createAppointment(input: {
     return null;
   }
 
+  console.error("[Appointments] 作成成功", { id: data.id, google_event_id: data.google_event_id });
   return mapAppointment(data);
 }
 
@@ -134,6 +144,58 @@ export async function cancelAppointment(
   return true;
 }
 
+/**
+ * 明日開催予定で、リマインド未送信の予約一覧（LINE push対象）
+ */
+export async function getAppointmentsForReminder(
+  rangeStartIso: string,
+  rangeEndIso: string,
+): Promise<AppointmentWithMember[]> {
+  const { data, error } = await supabaseAdmin
+    .from("fp_appointments")
+    .select("*, members(line_user_id, display_name)")
+    .eq("status", "scheduled")
+    .is("reminder_sent_at", null)
+    .gte("scheduled_at", rangeStartIso)
+    .lt("scheduled_at", rangeEndIso);
+
+  if (error || !data) {
+    console.error("[Appointments] リマインド対象取得エラー", error);
+    return [];
+  }
+
+  return data
+    .map((row) => ({
+      ...mapAppointment(row),
+      memberLineUserId: (row.members as { line_user_id: string | null } | null)?.line_user_id ?? null,
+      memberDisplayName: (row.members as { display_name: string | null } | null)?.display_name ?? null,
+    }))
+    .filter((appt) => appt.memberLineUserId);
+}
+
+/**
+ * リマインド送信枠を原子的に確保する（送信前に呼ぶ）
+ *
+ * reminder_sent_at IS NULL を条件にUPDATEし、実際に更新できた行があるかで
+ * 判定する。同一予約に対してcronが同時・重複実行されても、
+ * このUPDATEに成功できるのは1回だけであり、二重送信を防げる。
+ */
+export async function claimReminderSlot(appointmentId: string): Promise<boolean> {
+  const { data, error } = await supabaseAdmin
+    .from("fp_appointments")
+    .update({ reminder_sent_at: new Date().toISOString() })
+    .eq("id", appointmentId)
+    .is("reminder_sent_at", null)
+    .select("id");
+
+  if (error) {
+    console.error("[Appointments] リマインド枠確保エラー", error);
+    return false;
+  }
+
+  return (data?.length ?? 0) > 0;
+}
+
 function mapAppointment(row: Record<string, unknown>): FpAppointment {
   return {
     id: row.id as string,
@@ -145,6 +207,8 @@ function mapAppointment(row: Record<string, unknown>): FpAppointment {
     fpName: row.fp_name as string | null,
     notes: row.notes as string | null,
     googleEventId: (row.google_event_id as string) ?? null,
+    reminderSentAt: (row.reminder_sent_at as string) ?? null,
+    contactInfo: (row.contact_info as string) ?? null,
     createdAt: row.created_at as string,
   };
 }

@@ -22,8 +22,8 @@ node --version
 ### 1.2 プロジェクトのセットアップ
 
 ```bash
-cd C:\Users\motoki\OneDrive\デスクトップ\BD-Projects
-# ↑ お好みのパスでOK。VanceTrunkとは別フォルダで！
+cd C:\Users\motoki\OneDrive\デスクトップ\クラウドコード\bd-ai-concierge\bd-ai-concierge
+# ↑ VanceTrunkとは別フォルダで運用する
 
 # このプロジェクト一式を配置
 # （Claudeから提供されたZIPを展開 or 個別ファイル配置）

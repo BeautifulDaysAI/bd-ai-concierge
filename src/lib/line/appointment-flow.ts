@@ -15,7 +15,7 @@ import {
   findAvailableDates,
   findAvailableSlotsOnDate,
   createReservation,
-  deleteCalendarEvent,
+  getDaySchedule,
   getNowJst,
   jstToUtc,
   getJstPartsPublic,
@@ -26,85 +26,121 @@ import {
   cancelAppointment,
 } from "@/lib/db/queries/appointments";
 import { notifyFp } from "@/lib/notify/fp";
+import { notifyFpLine } from "@/lib/notify/line";
+import { createZoomMeeting } from "@/lib/zoom/client";
 import { searchFaq, formatFaqForPrompt } from "@/lib/ai/knowledge/faq";
 import { SYSTEM_PROMPT } from "@/lib/ai/prompts/system";
 
 const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
 
-/**
- * テキストから曜日を検出（口語対応）
- * 返り値: 0(日)〜6(土)、検出なしはnull
- */
-function detectDayOfWeek(text: string): number | null {
-  const patterns: [RegExp, number][] = [
-    [/日曜/, 0],
-    [/月曜/, 1],
-    [/火曜/, 2],
-    [/水曜/, 3],
-    [/木曜/, 4],
-    [/金曜/, 5],
-    [/土曜/, 6],
-  ];
-  for (const [regex, dow] of patterns) {
-    if (regex.test(text)) return dow;
-  }
-  return null;
-}
+// ── LLMベース意図分類・日時パーサー ──
 
-/**
- * 会話履歴からも曜日指定を検出
- */
-function detectDayOfWeekFromHistory(
-  currentText: string,
+const CLASSIFIER_MODEL = "claude-haiku-4-5-20251001";
+
+export type ClassifiedInput = {
+  intent: "date_time_request" | "business_hours_question" | "other_question";
+  fromDaysOffset: number;
+  toDaysOffset: number;
+  hourStart: number;
+  hourEnd: number;
+  dayOfWeek: number | null;
+  specificDate: { month: number; day: number } | null;
+  specificHour: number | null;
+};
+
+export async function classifyAndParseInput(
+  userText: string,
   history: { role: "user" | "assistant"; content: string }[],
-): number | null {
-  const fromCurrent = detectDayOfWeek(currentText);
-  if (fromCurrent !== null) return fromCurrent;
+): Promise<ClassifiedInput> {
+  const jst = getNowJst();
 
-  for (let i = history.length - 1; i >= 0; i--) {
-    const msg = history[i];
-    if (msg.role === "assistant" && msg.content.includes("ご希望の曜日・時間帯を教えてください")) break;
-    if (msg.role === "user") {
-      const detected = detectDayOfWeek(msg.content);
-      if (detected !== null) return detected;
-    }
+  const previousContext = extractReservationContext(history);
+  const contextText = previousContext.length > 0
+    ? `\nこれまでの会話でユーザーが伝えた条件:\n${previousContext.map((c) => `- 「${c}」`).join("\n")}\n\n最新の発言: 「${userText}」\n最新の発言で追加・変更された条件は反映し、以前の条件は明示的に変更されない限り引き継ぐ。`
+    : `\nユーザーの発言: 「${userText}」`;
+
+  const daysUntilNextMonday = ((1 - jst.dayOfWeek + 7) % 7) || 7;
+  const nextMon = jstToUtc(jst.year, jst.month, jst.day + daysUntilNextMonday, 0);
+  const nextSun = jstToUtc(jst.year, jst.month, jst.day + daysUntilNextMonday + 6, 0);
+  const nextMonJst = getJstPartsPublic(nextMon);
+  const nextSunJst = getJstPartsPublic(nextSun);
+  const weekAfterMon = jstToUtc(jst.year, jst.month, jst.day + daysUntilNextMonday + 7, 0);
+  const weekAfterSun = jstToUtc(jst.year, jst.month, jst.day + daysUntilNextMonday + 13, 0);
+  const weekAfterMonJst = getJstPartsPublic(weekAfterMon);
+  const weekAfterSunJst = getJstPartsPublic(weekAfterSun);
+
+  const prompt = `相談予約フローでユーザーの発言を分類・解析しJSONで返せ。
+
+今日: ${jst.year}年${jst.month + 1}月${jst.day}日（${WEEKDAYS[jst.dayOfWeek]}曜日）
+「来週」= ${nextMonJst.month + 1}/${nextMonJst.day}(月)〜${nextSunJst.month + 1}/${nextSunJst.day}(日)
+「再来週」= ${weekAfterMonJst.month + 1}/${weekAfterMonJst.day}(月)〜${weekAfterSunJst.month + 1}/${weekAfterSunJst.day}(日)
+${contextText}
+
+■ intent判定
+- "date_time_request": 予約の日時希望（「来週」「土曜日は?」「7/18 14時」「いつでもOK」「午後がいい」「七月十八日」等。曜日名+疑問符も日時希望に含む）
+- "business_hours_question": 営業日時の純粋な質問（「何時までやってますか」「祝日は予約できますか」等。特定日付・曜日で予約したい意図がないもの）
+- "other_question": 予約と無関係な質問（「NISAとは?」「料金は?」等）
+迷ったら "date_time_request" にせよ。
+
+■ date_time_requestの追加フィールド
+- specificDate: 具体日付→{"month":M,"day":D}に解決（「明日」→今日+1日で計算、「七月十八日」→{"month":7,"day":18}）。なければnull
+- specificHour: 具体時刻（「14時」→14）。なければnull
+- fromDaysOffset: 検索開始（今日=0, 明日=1, 来週=${daysUntilNextMonday}）
+- toDaysOffset: 検索終了（来週末=${daysUntilNextMonday + 6}, 最大60, 曜日のみ=28, いつでもOK=30）
+- hourStart: 希望開始時(9-21。午前=9, 午後=13, 夕方=17, 指定なし=9)
+- hourEnd: 希望終了時(9-21。午前中=12, 午後=18, 指定なし=21)
+- dayOfWeek: 曜日指定(0=日〜6=土。なければnull)
+
+■ business_hours_question/other_questionの場合
+全て初期値: fromDaysOffset=0,toDaysOffset=14,hourStart=9,hourEnd=21,dayOfWeek=null,specificDate=null,specificHour=null
+
+JSONのみ返せ。`;
+
+  try {
+    const result = await getAnthropicClient().messages.create({
+      model: CLASSIFIER_MODEL,
+      max_tokens: 300,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const content = result.content[0];
+    if (content.type !== "text") throw new Error("unexpected response type");
+
+    const jsonMatch = content.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error("no JSON in response");
+
+    const raw = JSON.parse(jsonMatch[0]);
+    console.error("[Classifier] 結果:", JSON.stringify(raw));
+
+    const intent = ["date_time_request", "business_hours_question", "other_question"].includes(raw.intent)
+      ? raw.intent as ClassifiedInput["intent"]
+      : "date_time_request";
+
+    return {
+      intent,
+      fromDaysOffset: typeof raw.fromDaysOffset === "number" ? Math.max(0, Math.min(60, raw.fromDaysOffset)) : 1,
+      toDaysOffset: typeof raw.toDaysOffset === "number" ? Math.max(1, Math.min(60, raw.toDaysOffset)) : 14,
+      hourStart: typeof raw.hourStart === "number" ? Math.max(9, Math.min(21, raw.hourStart)) : 9,
+      hourEnd: typeof raw.hourEnd === "number" ? Math.max(9, Math.min(21, raw.hourEnd)) : 21,
+      dayOfWeek: typeof raw.dayOfWeek === "number" && raw.dayOfWeek >= 0 && raw.dayOfWeek <= 6 ? raw.dayOfWeek : null,
+      specificDate: raw.specificDate && typeof raw.specificDate.month === "number" && typeof raw.specificDate.day === "number"
+        ? { month: raw.specificDate.month, day: raw.specificDate.day }
+        : null,
+      specificHour: typeof raw.specificHour === "number" ? raw.specificHour : null,
+    };
+  } catch (err) {
+    console.error("[Classifier] LLM分類失敗、date_time_requestとして処理", err);
+    return {
+      intent: "date_time_request",
+      fromDaysOffset: 1,
+      toDaysOffset: 14,
+      hourStart: 9,
+      hourEnd: 21,
+      dayOfWeek: null,
+      specificDate: null,
+      specificHour: null,
+    };
   }
-  return null;
-}
-
-// ── 割り込み質問の検出 ──
-
-const DAY_KEYWORDS = /土日|週末|土曜|日曜|平日|休み|やって(い|な)|営業|祝日/;
-const PREFERENCE_INDICATORS = /でやりたい|がいい|がいい|希望|にして|でお願い|がいいな|で$/;
-const QUESTION_INDICATORS = /？|\?|ですか|でしょうか|ありますか|いますか|なの|かな|けど|のは|どう/;
-
-/**
- * 曜日を含む「希望変更」を検出（「土曜でやりたい」「平日がいい」等）
- * 日曜希望か否かも返す
- */
-export function isDayOfWeekPreference(text: string): { match: boolean; isSunday: boolean; dayOfWeek: number | null } {
-  const dow = detectDayOfWeek(text);
-  if (dow !== null) {
-    if (QUESTION_INDICATORS.test(text) && !PREFERENCE_INDICATORS.test(text)) {
-      return { match: false, isSunday: false, dayOfWeek: null };
-    }
-    return { match: true, isSunday: dow === 0, dayOfWeek: dow };
-  }
-  if (/平日/.test(text) && PREFERENCE_INDICATORS.test(text)) {
-    return { match: true, isSunday: false, dayOfWeek: null };
-  }
-  return { match: false, isSunday: false, dayOfWeek: null };
-}
-
-/**
- * 営業曜日に関する「純粋な質問」を検出（「土日やってない？」等）
- */
-export function isBusinessDayQuestion(text: string): boolean {
-  return DAY_KEYWORDS.test(text) && QUESTION_INDICATORS.test(text);
-}
-
-export function isGeneralQuestion(text: string): boolean {
-  return QUESTION_INDICATORS.test(text);
 }
 
 export const BUSINESS_DAY_POLICY = `ご相談は月〜土で承っております（日曜はお休みです）。
@@ -238,151 +274,162 @@ function extractReservationContext(
 }
 
 /**
- * ユーザーの希望をAIでパースして日時制約に変換
+ * 指定の月(0-indexed)・日が、JST基準で今日より過去かどうかを判定
+ * （今年の日付として解釈し、年をまたいで未来に丸めることはしない）
  */
-async function parsePreference(
-  userText: string,
-  history: { role: "user" | "assistant"; content: string }[],
-): Promise<{
-  from: Date;
-  to: Date;
-  preferredHourStart: number;
-  preferredHourEnd: number;
-  targetDayOfWeek?: number;
-}> {
-  const jst = getNowJst();
-
-  const previousContext = extractReservationContext(history);
-  const contextText = previousContext.length > 0
-    ? `\n\nこれまでの会話でユーザーが伝えた条件:\n${previousContext.map((c) => `- 「${c}」`).join("\n")}\n\n最新の発言: 「${userText}」\n\n最新の発言で追加・変更された条件は反映し、以前の条件（時間帯等）は明示的に変更されない限り引き継いでください。`
-    : `\nユーザーの希望: 「${userText}」`;
-
-  // 「来週」「再来週」の正確な日付範囲を事前計算してAIに渡す
-  // 週の始まり=月曜（dayOfWeek: 1）
-  const daysUntilNextMonday = ((1 - jst.dayOfWeek + 7) % 7) || 7;
-  const nextMondayDay = jst.day + daysUntilNextMonday;
-  const nextSundayDay = nextMondayDay + 6;
-  const weekAfterMondayDay = nextMondayDay + 7;
-  const weekAfterSundayDay = weekAfterMondayDay + 6;
-
-  const nextMon = jstToUtc(jst.year, jst.month, nextMondayDay, 0);
-  const nextSun = jstToUtc(jst.year, jst.month, nextSundayDay, 0);
-  const nextMonJst = getJstPartsPublic(nextMon);
-  const nextSunJst = getJstPartsPublic(nextSun);
-
-  const weekAfterMon = jstToUtc(jst.year, jst.month, weekAfterMondayDay, 0);
-  const weekAfterSun = jstToUtc(jst.year, jst.month, weekAfterSundayDay, 0);
-  const weekAfterMonJst = getJstPartsPublic(weekAfterMon);
-  const weekAfterSunJst = getJstPartsPublic(weekAfterSun);
-
-  const weekReference = `
-「来週」= ${nextMonJst.month + 1}/${nextMonJst.day}(月)〜${nextSunJst.month + 1}/${nextSunJst.day}(日) （今日から${daysUntilNextMonday}日後の月曜から）
-「再来週」= ${weekAfterMonJst.month + 1}/${weekAfterMonJst.day}(月)〜${weekAfterSunJst.month + 1}/${weekAfterSunJst.day}(日)
-「今週」= 今日〜${nextMonJst.month + 1}/${nextMonJst.day - 1 > 0 ? nextMonJst.day - 1 : nextMonJst.day}(日)`;
-
-  const prompt = `ユーザーの希望日時を解析してJSON形式で返してください。
-今日は${jst.year}年${jst.month + 1}月${jst.day}日（${WEEKDAYS[jst.dayOfWeek]}曜日）です。
-${weekReference}
-${contextText}
-
-以下のJSON形式のみを返してください（説明不要）:
-{
-  "fromDaysOffset": 検索開始日（今日から何日後。0=今日、1=明日。「来週」なら${daysUntilNextMonday}）,
-  "toDaysOffset": 検索終了日（今日から何日後。最大60。「来週」なら${daysUntilNextMonday + 6}。曜日指定のみで時期指定なしなら28）,
-  "hourStart": 希望開始時間（9-21の整数。「午後」なら13、「夕方」なら17、「19時以降」なら19。指定なしは9）,
-  "hourEnd": 希望終了時間（9-21の整数。「午前中」なら12、「午後」なら18。指定なしは21）,
-  "dayOfWeek": 特定曜日指定（0=日,1=月,2=火,3=水,4=木,5=金,6=土。指定なしはnull。「土曜」なら6、「月曜」なら1）
-}`;
-
-  try {
-    const result = await getAnthropicClient().messages.create({
-      model: getDefaultModel(),
-      max_tokens: 200,
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    const content = result.content[0];
-    if (content.type !== "text") throw new Error("unexpected response type");
-
-    const jsonMatch = content.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("no JSON in response");
-
-    const parsed = JSON.parse(jsonMatch[0]) as {
-      fromDaysOffset: number;
-      toDaysOffset: number;
-      hourStart: number;
-      hourEnd: number;
-      dayOfWeek: number | null;
-    };
-
-    console.log("[Reservation] パース結果:", parsed);
-
-    const hourStart = Math.max(9, Math.min(21, parsed.hourStart));
-    const hourEnd = Math.max(hourStart + 1, Math.min(21, parsed.hourEnd));
-
-    // 曜日指定がある場合、口語検出結果を優先（AI誤判定防止）
-    const detectedDow = detectDayOfWeekFromHistory(userText, history);
-    const targetDayOfWeek = detectedDow ?? (parsed.dayOfWeek !== null ? parsed.dayOfWeek : undefined);
-
-    // 曜日指定時は検索範囲を広げる（最低28日）
-    let toDaysOffset = Math.min(60, parsed.toDaysOffset);
-    if (targetDayOfWeek !== undefined && toDaysOffset < 28) {
-      toDaysOffset = 28;
-    }
-
-    const from = jstToUtc(
-      jst.year, jst.month,
-      jst.day + Math.max(0, parsed.fromDaysOffset),
-      hourStart,
-    );
-
-    const to = jstToUtc(
-      jst.year, jst.month,
-      jst.day + toDaysOffset,
-      hourEnd,
-    );
-
-    return { from, to, preferredHourStart: hourStart, preferredHourEnd: hourEnd, targetDayOfWeek };
-  } catch (err) {
-    console.warn("[Reservation] 希望パース失敗、デフォルト使用", err);
-    const detectedDow = detectDayOfWeekFromHistory(userText, history);
-    const from = jstToUtc(jst.year, jst.month, jst.day + 1, 9);
-    const to = jstToUtc(jst.year, jst.month, jst.day + (detectedDow !== null ? 28 : 14), 21);
-    return { from, to, preferredHourStart: 9, preferredHourEnd: 21, targetDayOfWeek: detectedDow ?? undefined };
-  }
+function isPastDate(
+  jst: { year: number; month: number; day: number },
+  month0: number,
+  day: number,
+): boolean {
+  return month0 < jst.month || (month0 === jst.month && day < jst.day);
 }
 
 // ── ステップ1→2: 希望を受け取り、日付候補を返す ──
 
 export async function handlePreferenceAndFindDates(
-  userText: string,
-  history: { role: "user" | "assistant"; content: string }[],
+  _userText: string,
+  _history: { role: "user" | "assistant"; content: string }[],
+  parsed: ClassifiedInput,
 ): Promise<string> {
-  // 日曜指定の即時応答
-  const explicitDow = detectDayOfWeekFromHistory(userText, history);
-  if (explicitDow === 0) {
+  if (parsed.dayOfWeek === 0) {
     return `申し訳ありません、日曜日は予約不可となっております。
 
 平日（月〜金）または土曜日でご検討ください。
 ご希望の曜日・時間帯をお知らせください。`;
   }
 
+  // 具体日付+時間 → 日付選択・時間選択をスキップ
+  if (parsed.specificDate && parsed.specificHour !== null) {
+    try {
+      const jst = getNowJst();
+      const year = jst.year;
+      const month = parsed.specificDate.month - 1;
+      if (isPastDate(jst, month, parsed.specificDate.day)) {
+        return `申し訳ありません、${parsed.specificDate.month}/${parsed.specificDate.day}は過去の日付のため予約できません。
+本日以降の日程をお知らせください。`;
+      }
+
+      const dayOfWeek = getJstPartsPublic(jstToUtc(year, month, parsed.specificDate.day, 12)).dayOfWeek;
+
+      const schedule = getDaySchedule(year, month, parsed.specificDate.day, dayOfWeek);
+      if (!schedule) {
+        return `申し訳ありません、${parsed.specificDate.month}/${parsed.specificDate.day}は予約不可日です（日曜・祝日）。
+別の日程をお知らせください。`;
+      }
+
+      if (parsed.specificHour < schedule.open || parsed.specificHour > schedule.lastStart) {
+        return `申し訳ありません、${parsed.specificDate.month}/${parsed.specificDate.day}の営業時間は${schedule.open}:00〜${schedule.close}:00です。
+この範囲内でご希望の時間をお知らせください。`;
+      }
+
+      const slots = await findAvailableSlotsOnDate(
+        year, month, parsed.specificDate.day, schedule,
+        parsed.specificHour, parsed.specificHour + 1,
+      );
+
+      const dayLabel = `${parsed.specificDate.month}/${parsed.specificDate.day}(${WEEKDAYS[dayOfWeek]})`;
+
+      if (slots.length > 0) {
+        const startH = String(parsed.specificHour).padStart(2, "0");
+        const endH = String(parsed.specificHour + 1).padStart(2, "0");
+        return `${dayLabel} の空き時間です。
+以下の時間帯からお選びください。
+番号でお答えください。
+
+1. ${startH}:00〜${endH}:00
+
+他の日程をご希望の場合は、改めて希望をお知らせください。`;
+      }
+
+      const allSlots = await findAvailableSlotsOnDate(year, month, parsed.specificDate.day, schedule);
+      if (allSlots.length === 0) {
+        return formatNearbyAlternatives(dayLabel, year, month, parsed.specificDate.day, parsed);
+      }
+
+      const maxSlots = Math.min(allSlots.length, 5);
+      let text = `${parsed.specificHour}:00〜はすでに予約が入っております。
+${dayLabel} の他の空き時間をご案内します。
+以下の時間帯からお選びください。
+番号でお答えください。
+
+`;
+      for (let i = 0; i < maxSlots; i++) {
+        const s = allSlots[i];
+        const sH = s.label.match(/(\d+:\d+)〜/)?.[1] ?? "";
+        const eH = s.label.match(/〜(\d+:\d+)/)?.[1] ?? "";
+        text += `${i + 1}. ${sH}〜${eH}\n`;
+      }
+      text += `\n他の日程をご希望の場合は、改めて希望をお知らせください。`;
+      return text;
+    } catch (err) {
+      console.error("[Reservation] 日時直接指定エラー", err);
+    }
+  }
+
+  // 具体日付のみ（時間指定なし）→ その日の空き時間を直接表示
+  if (parsed.specificDate) {
+    try {
+      const jst = getNowJst();
+      const year = jst.year;
+      const month = parsed.specificDate.month - 1;
+      if (isPastDate(jst, month, parsed.specificDate.day)) {
+        return `申し訳ありません、${parsed.specificDate.month}/${parsed.specificDate.day}は過去の日付のため予約できません。
+本日以降の日程をお知らせください。`;
+      }
+
+      const dayOfWeek = getJstPartsPublic(jstToUtc(year, month, parsed.specificDate.day, 12)).dayOfWeek;
+      const schedule = getDaySchedule(year, month, parsed.specificDate.day, dayOfWeek);
+      if (!schedule) {
+        return `申し訳ありません、${parsed.specificDate.month}/${parsed.specificDate.day}は予約不可日です（日曜・祝日）。
+別の日程をお知らせください。`;
+      }
+
+      const slots = await findAvailableSlotsOnDate(
+        year, month, parsed.specificDate.day, schedule,
+        parsed.hourStart, parsed.hourEnd,
+      );
+      const dayLabel = `${parsed.specificDate.month}/${parsed.specificDate.day}(${WEEKDAYS[dayOfWeek]})`;
+
+      if (slots.length === 0) {
+        return formatNearbyAlternatives(dayLabel, year, month, parsed.specificDate.day, parsed);
+      }
+
+      const maxSlots = Math.min(slots.length, 5);
+      let text = `${dayLabel} の空き時間です。
+以下の時間帯からお選びください。
+番号でお答えください。
+
+`;
+      for (let i = 0; i < maxSlots; i++) {
+        const s = slots[i];
+        const sH = s.label.match(/(\d+:\d+)〜/)?.[1] ?? "";
+        const eH = s.label.match(/〜(\d+:\d+)/)?.[1] ?? "";
+        text += `${i + 1}. ${sH}〜${eH}\n`;
+      }
+      text += `\n他の日程をご希望の場合は、改めて希望をお知らせください。`;
+      return text;
+    } catch (err) {
+      console.error("[Reservation] 日付指定エラー", err);
+    }
+  }
+
+  // 範囲検索（「来週」「土曜がいい」「いつでもOK」等）
   try {
-    const constraints = await parsePreference(userText, history);
+    const jst = getNowJst();
+    const hourStart = Math.max(9, Math.min(21, parsed.hourStart));
+    const hourEnd = Math.max(hourStart + 1, Math.min(21, parsed.hourEnd));
 
-    // parsePreferenceでも日曜が返った場合のガード
-    if (constraints.targetDayOfWeek === 0) {
-      return `申し訳ありません、日曜日は予約不可となっております。
-
-平日（月〜金）または土曜日でご検討ください。
-ご希望の曜日・時間帯をお知らせください。`;
+    let toDaysOffset = Math.min(60, parsed.toDaysOffset);
+    if (parsed.dayOfWeek !== null && toDaysOffset < 28) {
+      toDaysOffset = 28;
     }
 
-    const dates = findAvailableDates({
-      from: constraints.from,
-      to: constraints.to,
-      targetDayOfWeek: constraints.targetDayOfWeek,
-    });
+    const from = jstToUtc(jst.year, jst.month, jst.day + Math.max(0, parsed.fromDaysOffset), hourStart);
+    const to = jstToUtc(jst.year, jst.month, jst.day + toDaysOffset, hourEnd);
+    const targetDayOfWeek = parsed.dayOfWeek ?? undefined;
+
+    const dates = findAvailableDates({ from, to, targetDayOfWeek });
 
     if (dates.length === 0) {
       return `申し訳ありません、ご希望の条件では候補日が見つかりませんでした。
@@ -391,26 +438,115 @@ export async function handlePreferenceAndFindDates(
 （例：来週の平日、土曜も可、再来週あたり）`;
     }
 
-    const maxDates = Math.min(dates.length, 5);
-    let text = `以下の日程から候補をお選びください。
-番号でお答えください。
-
-`;
-    for (let i = 0; i < maxDates; i++) {
+    const MAX_CHECK = 10;
+    const TARGET_COUNT = 5;
+    const confirmedDates: typeof dates = [];
+    for (let i = 0; i < Math.min(dates.length, MAX_CHECK) && confirmedDates.length < TARGET_COUNT; i++) {
       const d = dates[i];
-      const dayLabel = `${d.month + 1}/${d.day}(${WEEKDAYS[d.dayOfWeek]})`;
-      text += `${i + 1}. ${dayLabel}\n`;
+      const slots = await findAvailableSlotsOnDate(d.year, d.month, d.day, d.schedule, hourStart, hourEnd);
+      if (slots.length > 0) {
+        confirmedDates.push(d);
+      }
     }
 
-    text += `
-他の日程をご希望の場合は、改めて希望をお知らせください。`;
+    if (confirmedDates.length === 0) {
+      const jstNow = getNowJst();
+      const extendedDates = findAvailableDates({
+        from: to,
+        to: jstToUtc(jstNow.year, jstNow.month, jstNow.day + 60, 21),
+        targetDayOfWeek,
+      });
+      for (let i = 0; i < Math.min(extendedDates.length, MAX_CHECK) && confirmedDates.length < TARGET_COUNT; i++) {
+        const d = extendedDates[i];
+        const slots = await findAvailableSlotsOnDate(d.year, d.month, d.day, d.schedule, hourStart, hourEnd);
+        if (slots.length > 0) {
+          confirmedDates.push(d);
+        }
+      }
 
-    return text;
+      if (confirmedDates.length === 0) {
+        return `申し訳ありません、ご希望の条件では空き枠のある日が見つかりませんでした。
+
+別の日程や時間帯でご希望があればお知らせください。
+（例：来週の平日、土曜も可、再来週あたり）`;
+      }
+
+      const originalLabel = dates.length > 0
+        ? `${dates[0].month + 1}/${dates[0].day}(${WEEKDAYS[dates[0].dayOfWeek]})`
+        : "ご指定の日程";
+
+      return formatDateOrTimeList(confirmedDates, hourStart, hourEnd, `申し訳ありません、${originalLabel}は空き枠がありませんでした。\n`);
+    }
+
+    return formatDateOrTimeList(confirmedDates, hourStart, hourEnd);
   } catch (err) {
     console.error("[Reservation] 日付検索エラー", err);
     return `申し訳ありません、カレンダーの確認中にエラーが発生しました。
 少し時間をおいて再度「相談予約」とお送りください。`;
   }
+}
+
+async function formatNearbyAlternatives(
+  dayLabel: string,
+  year: number,
+  month: number,
+  day: number,
+  parsed: ClassifiedInput,
+): Promise<string> {
+  const hStart = parsed.hourStart ?? 9;
+  const hEnd = parsed.hourEnd ?? 21;
+  const targetDow = parsed.dayOfWeek ?? undefined;
+
+  const nextDay = jstToUtc(year, month, day + 1, 0);
+  const searchEnd = jstToUtc(year, month, day + 60, 21);
+  const nearbyDates = findAvailableDates({ from: nextDay, to: searchEnd, targetDayOfWeek: targetDow });
+  const nearbyConfirmed: typeof nearbyDates = [];
+  for (let i = 0; i < Math.min(nearbyDates.length, 10) && nearbyConfirmed.length < 5; i++) {
+    const nd = nearbyDates[i];
+    const ndSlots = await findAvailableSlotsOnDate(nd.year, nd.month, nd.day, nd.schedule, hStart, hEnd);
+    if (ndSlots.length > 0) nearbyConfirmed.push(nd);
+  }
+  if (nearbyConfirmed.length === 0) {
+    return `申し訳ありません、${dayLabel}は空き枠がありませんでした。\n別の日程をお知らせください。`;
+  }
+  return formatDateOrTimeList(
+    nearbyConfirmed, hStart, hEnd,
+    `申し訳ありません、${dayLabel}は空き枠がありませんでした。\n`,
+  );
+}
+
+async function formatDateOrTimeList(
+  confirmedDates: Array<{ year: number; month: number; day: number; dayOfWeek: number; schedule: { open: number; close: number; lastStart: number } }>,
+  hourStart: number,
+  hourEnd: number,
+  prefix = "",
+): Promise<string> {
+  if (confirmedDates.length === 1) {
+    const d = confirmedDates[0];
+    const dayLabel = `${d.month + 1}/${d.day}(${WEEKDAYS[d.dayOfWeek]})`;
+    const slots = await findAvailableSlotsOnDate(d.year, d.month, d.day, d.schedule, hourStart, hourEnd);
+    const maxSlots = Math.min(slots.length, 5);
+    let text = prefix ? `${prefix}最も近い${dayLabel} の空き時間です。\n` : `${dayLabel} の空き時間です。\n`;
+    text += `以下の時間帯からお選びください。\n番号でお答えください。\n\n`;
+    for (let i = 0; i < maxSlots; i++) {
+      const s = slots[i];
+      const sH = s.label.match(/(\d+:\d+)〜/)?.[1] ?? "";
+      const eH = s.label.match(/〜(\d+:\d+)/)?.[1] ?? "";
+      text += `${i + 1}. ${sH}〜${eH}\n`;
+    }
+    text += `\n他の日程をご希望の場合は、改めて希望をお知らせください。`;
+    return text;
+  }
+
+  let text = prefix;
+  text += prefix ? `近い日程で以下の日程から候補をお選びください。\n` : `以下の日程から候補をお選びください。\n`;
+  text += `番号でお答えください。\n\n`;
+  for (let i = 0; i < confirmedDates.length; i++) {
+    const d = confirmedDates[i];
+    text += `${i + 1}. ${d.month + 1}/${d.day}(${WEEKDAYS[d.dayOfWeek]})\n`;
+  }
+  text += `\n他の日程をご希望の場合は、改めて希望をお知らせください。`;
+  return text;
 }
 
 /**
@@ -561,12 +697,15 @@ function extractPreferredHoursFromHistory(
   return {};
 }
 
-// ── ステップ3→確定: 時間選択から予約確定 ──
+// ── ステップ3→連絡先確認: 時間選択を受けて連絡先をヒアリング ──
+
+export const CONTACT_REQUEST_PROMPT =
+  "当日ご連絡のため、お電話番号かメールアドレスを教えてください。";
 
 export async function tryConfirmAppointment(
   userText: string,
-  memberId: string,
-  memberName: string,
+  _memberId: string,
+  _memberName: string,
   history: { role: "user" | "assistant"; content: string }[],
 ): Promise<string | null> {
   const step = getReservationStep(history);
@@ -597,6 +736,71 @@ export async function tryConfirmAppointment(
     return "申し訳ありません、日時の解析に失敗しました。改めて「相談予約」とお送りください。";
   }
 
+  return `${fullLabel} で予約を確定いたします。
+
+${CONTACT_REQUEST_PROMPT}`;
+}
+
+// ── ステップ4→確定: 連絡先を受け取り予約を確定 ──
+
+const CONTACT_PHONE_REGEX = /^0\d{9,10}$/;
+const CONTACT_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isValidContactInfo(text: string): boolean {
+  const digitsOnly = text.replace(/[-\s]/g, "");
+  return CONTACT_PHONE_REGEX.test(digitsOnly) || CONTACT_EMAIL_REGEX.test(text);
+}
+
+export function isAwaitingContactInfo(
+  history: { role: "user" | "assistant"; content: string }[],
+): boolean {
+  const lastBotMsg = [...history].reverse().find((m) => m.role === "assistant");
+  return !!lastBotMsg && lastBotMsg.content.includes(CONTACT_REQUEST_PROMPT);
+}
+
+function extractPendingSlotLabel(
+  history: { role: "user" | "assistant"; content: string }[],
+): string | null {
+  const lastBotMsg = [...history].reverse().find(
+    (m) => m.role === "assistant" && m.content.includes(CONTACT_REQUEST_PROMPT),
+  );
+  if (!lastBotMsg) return null;
+
+  const match = lastBotMsg.content.match(/^(\d+\/\d+\([^)]+\)\s*\d{2}:\d{2}〜\d{2}:\d{2})/);
+  return match ? match[1] : null;
+}
+
+export async function tryFinalizeAppointmentWithContact(
+  userText: string,
+  memberId: string,
+  memberName: string,
+  history: { role: "user" | "assistant"; content: string }[],
+): Promise<string | null> {
+  if (!isAwaitingContactInfo(history)) return null;
+
+  const fullLabel = extractPendingSlotLabel(history);
+  if (!fullLabel) {
+    return "申し訳ありません、予約情報の確認に失敗しました。改めて「相談予約」とお送りください。";
+  }
+
+  const trimmed = userText.trim();
+  if (!isValidContactInfo(trimmed)) {
+    // fullLabel と CONTACT_REQUEST_PROMPT を再掲することで、
+    // 不正入力後も isAwaitingContactInfo / extractPendingSlotLabel が
+    // 次のターンで正しく状態を認識できるようにする
+    return `${fullLabel} で予約を確定いたします。
+
+恐れ入りますが、電話番号かメールアドレスの形式でお送りください。
+例：09012345678 または taro@example.com
+
+${CONTACT_REQUEST_PROMPT}`;
+  }
+
+  const parsed = parseSlotLabel(fullLabel);
+  if (!parsed) {
+    return "申し訳ありません、日時の解析に失敗しました。改めて「相談予約」とお送りください。";
+  }
+
   const calResult = await createReservation(parsed, memberName);
   if (!calResult.success) {
     return `申し訳ありません、予約の確定に失敗しました。
@@ -608,10 +812,16 @@ export async function tryConfirmAppointment(
     scheduledAt: parsed.toISOString(),
     durationMinutes: 60,
     googleEventId: calResult.eventId,
+    contactInfo: trimmed,
   });
 
   if (!appt) {
-    console.warn("[Reservation] DB保存は失敗したがカレンダー登録は成功");
+    console.error("[Reservation] DB保存は失敗したがカレンダー登録は成功");
+  }
+
+  const zoomResult = await createZoomMeeting(parsed, `Beautiful Days FP相談 - ${memberName}`);
+  if (!zoomResult.success) {
+    console.error("[Reservation] Zoomミーティング作成スキップ/失敗", zoomResult.error);
   }
 
   await notifyFp({
@@ -622,20 +832,45 @@ export async function tryConfirmAppointment(
     details: {
       scheduled_at: parsed.toISOString(),
       google_event_id: calResult.eventId,
+      zoom_join_url: zoomResult.joinUrl ?? null,
+      contact_info: trimmed,
     },
     link: `${process.env.NEXT_PUBLIC_APP_URL}/admin/appointments`,
   });
+
+  const fpLineParts = [
+    `新規予約: ${formatShortJstLabel(parsed)} ${memberName}様`,
+    `連絡先: ${trimmed}`,
+  ];
+  if (zoomResult.success && zoomResult.joinUrl) {
+    fpLineParts.push(`Zoom: ${zoomResult.joinUrl}`);
+  }
+  await notifyFpLine(fpLineParts.join("\n"));
+
+  const zoomSection =
+    zoomResult.success && zoomResult.joinUrl
+      ? `\n\n📹 オンライン相談のURL：${zoomResult.joinUrl}\n当日はこちらからご参加ください。`
+      : "\n\nオンライン相談の詳細URLは、担当者より別途LINEでご案内いたします。";
 
   return `予約が確定しました。
 
 ▼ ご予約内容
 日時：${fullLabel}
 所要時間：約1時間
+連絡先：${trimmed}
 
 担当者から改めてご連絡します。
 ご相談内容を事前に整理いただけると、より充実した時間になります。
 
-ご予約の変更・キャンセルは「予約変更」とお送りください。`;
+ご予約の変更・キャンセルは「予約変更」とお送りください。${zoomSection}`;
+}
+
+/**
+ * FP向けLINE通知用の短い日時ラベル（例: "7/27 15:00"）
+ */
+function formatShortJstLabel(date: Date): string {
+  const jst = getJstPartsPublic(date);
+  return `${jst.month + 1}/${jst.day} ${String(jst.hour).padStart(2, "0")}:00`;
 }
 
 /**
@@ -680,23 +915,9 @@ export async function handleCancelRequest(
   const scheduledJst = getJstPartsPublic(new Date(appt.scheduledAt));
   const label = `${scheduledJst.month + 1}/${scheduledJst.day}(${WEEKDAYS[scheduledJst.dayOfWeek]}) ${String(scheduledJst.hour).padStart(2, "0")}:00`;
 
-  if (appt.googleEventId) {
-    const deleteResult = await deleteCalendarEvent(appt.googleEventId);
-    if (!deleteResult.success) {
-      console.error("[Reservation] カレンダー削除失敗", deleteResult.error);
-      await notifyFp({
-        type: "cancel_error",
-        memberName,
-        memberId,
-        summary: `カレンダー削除失敗: ${label}`,
-        details: { error: deleteResult.error, appointmentId: appt.id },
-        link: `${process.env.NEXT_PUBLIC_APP_URL}/admin/appointments`,
-      });
-    }
-  } else {
-    console.warn("[Reservation] google_event_id が未保存のためカレンダー削除をスキップ");
-  }
-
+  // カレンダー削除の自動処理は行わない（複数カレンダー・トークン失効等で
+  // 信頼性が低いため）。DB上は即キャンセル済みにし、
+  // Googleカレンダーからの削除は担当者が手動で行う運用とする。
   const cancelled = await cancelAppointment(appt.id);
   if (!cancelled) {
     return "申し訳ありません、キャンセル処理中にエラーが発生しました。\n担当者に直接ご連絡ください。";
@@ -706,15 +927,18 @@ export async function handleCancelRequest(
     type: "cancel_appointment",
     memberName,
     memberId,
-    summary: `予約キャンセル: ${label}`,
-    details: { appointmentId: appt.id, scheduledAt: appt.scheduledAt },
+    summary: `予約キャンセル（要カレンダー手動削除）: ${label}`,
+    details: { appointmentId: appt.id, scheduledAt: appt.scheduledAt, googleEventId: appt.googleEventId },
     link: `${process.env.NEXT_PUBLIC_APP_URL}/admin/appointments`,
   });
 
-  return `以下の予約をキャンセルしました。
+  await notifyFpLine(`キャンセル: ${formatShortJstLabel(new Date(appt.scheduledAt))} ${memberName}様`);
+
+  return `予約のキャンセルを受け付けました。
 
 ▼ キャンセル済み
 日時：${label}
 
+担当者がカレンダーの調整を行います。
 再度予約する場合は「相談予約」とお送りください。`;
 }

@@ -71,6 +71,15 @@ function getCalendarId(): string {
   return process.env.GOOGLE_CALENDAR_ID ?? "primary";
 }
 
+function getReadCalendarIds(): string[] {
+  const writeId = getCalendarId();
+  const extra = process.env.GOOGLE_CALENDAR_READ_IDS;
+  if (!extra) return [writeId];
+  const ids = extra.split(",").map((s) => s.trim()).filter(Boolean);
+  const unique = new Set([writeId, ...ids]);
+  return [...unique];
+}
+
 export type TimeSlot = {
   start: Date;
   end: Date;
@@ -101,7 +110,7 @@ function getJstParts(d: Date): { year: number; month: number; day: number; hour:
 /**
  * 指定日JSTの営業スケジュールを返す。予約不可の日はnull
  */
-function getDaySchedule(year: number, month: number, day: number, dayOfWeek: number): DaySchedule | null {
+export function getDaySchedule(year: number, month: number, day: number, dayOfWeek: number): DaySchedule | null {
   if (dayOfWeek === 0) return null;
   if (isJapaneseHoliday(year, month, day)) return null;
   if (dayOfWeek === 6) return SATURDAY_SCHEDULE;
@@ -176,11 +185,12 @@ export async function findAvailableSlotsOnDate(
   preferredHourEnd?: number,
 ): Promise<TimeSlot[]> {
   const calendar = getCalendarClient();
-  const calendarId = getCalendarId();
+  const readIds = getReadCalendarIds();
+  const dateStr = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 
-  console.log("[Calendar] freeBusy検索", {
-    calendarId,
-    date: `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
+  console.error("[Calendar] freeBusy検索", {
+    readIds,
+    date: dateStr,
     hasClientId: !!process.env.GOOGLE_CLIENT_ID,
     hasRefreshToken: !!process.env.GOOGLE_REFRESH_TOKEN,
   });
@@ -193,15 +203,21 @@ export async function findAvailableSlotsOnDate(
       timeMin: dayStart.toISOString(),
       timeMax: dayEnd.toISOString(),
       timeZone: "Asia/Tokyo",
-      items: [{ id: calendarId }],
+      items: readIds.map((id) => ({ id })),
     },
   });
 
-  const busySlots = freeBusyRes.data.calendars?.[calendarId]?.busy ?? [];
-  console.log("[Calendar] busy区間:", busySlots.length, "件", busySlots.map((b) => `${b.start}〜${b.end}`));
-  const busyRanges = busySlots.map((b) => ({
-    start: new Date(b.start!),
-    end: new Date(b.end!),
+  const allBusy: Array<{ start: string; end: string }> = [];
+  for (const id of readIds) {
+    const slots = freeBusyRes.data.calendars?.[id]?.busy ?? [];
+    console.error(`[Calendar] busy区間 [${id}]:`, slots.length, "件", slots.map((b) => `${b.start}〜${b.end}`));
+    for (const b of slots) {
+      if (b.start && b.end) allBusy.push({ start: b.start, end: b.end });
+    }
+  }
+  const busyRanges = allBusy.map((b) => ({
+    start: new Date(b.start),
+    end: new Date(b.end),
   }));
 
   const now = new Date();
@@ -256,7 +272,7 @@ export async function findAvailableSlots(constraints: {
     maxResults = 3,
   } = constraints;
 
-  console.log("[Calendar] 空き検索開始", {
+  console.error("[Calendar] 空き検索開始", {
     from: from.toISOString(),
     to: to.toISOString(),
     preferredHourStart,
@@ -264,7 +280,7 @@ export async function findAvailableSlots(constraints: {
   });
 
   const dates = findAvailableDates({ from, to });
-  console.log("[Calendar] 候補日数:", dates.length);
+  console.error("[Calendar] 候補日数:", dates.length);
 
   const allSlots: TimeSlot[] = [];
 
@@ -280,7 +296,7 @@ export async function findAvailableSlots(constraints: {
     allSlots.push(...daySlots.slice(0, remaining));
   }
 
-  console.log("[Calendar] 最終候補数:", allSlots.length);
+  console.error("[Calendar] 最終候補数:", allSlots.length);
   return allSlots;
 }
 
@@ -297,6 +313,7 @@ export async function createReservation(
   const end = new Date(start.getTime() + 60 * 60 * 1000);
 
   try {
+    console.error("[Calendar] イベント作成実行", { calendarId, start: start.toISOString(), userName });
     const event = await calendar.events.insert({
       calendarId,
       requestBody: {
@@ -313,9 +330,10 @@ export async function createReservation(
       },
     });
 
+    console.error("[Calendar] イベント作成成功", { calendarId, eventId: event.data.id });
     return { success: true, eventId: event.data.id ?? undefined };
   } catch (err) {
-    console.error("[Calendar] イベント作成エラー", err);
+    console.error("[Calendar] イベント作成エラー", { calendarId, err: String(err) });
     return { success: false, error: String(err) };
   }
 }
@@ -327,20 +345,30 @@ export async function deleteCalendarEvent(
   eventId: string,
 ): Promise<{ success: boolean; error?: string }> {
   const calendar = getCalendarClient();
-  const calendarId = getCalendarId();
+  const primaryId = getCalendarId();
+  const allIds = getReadCalendarIds();
 
-  try {
-    await calendar.events.delete({ calendarId, eventId });
-    return { success: true };
-  } catch (err: unknown) {
-    const status = (err as { code?: number })?.code;
-    if (status === 404 || status === 410) {
-      console.warn("[Calendar] イベント既に削除済み", eventId);
+  for (const calendarId of [primaryId, ...allIds.filter((id) => id !== primaryId)]) {
+    try {
+      console.error("[Calendar] イベント削除実行", { calendarId, eventId });
+      await calendar.events.delete({ calendarId, eventId });
+      console.error("[Calendar] イベント削除成功", { calendarId, eventId });
       return { success: true };
+    } catch (err: unknown) {
+      const status = (err as { code?: number })?.code;
+      console.error("[Calendar] イベント削除エラー", { calendarId, eventId, status, err: String(err) });
+      if (status === 404 || status === 410) {
+        continue;
+      }
+      if (status === 403) {
+        continue;
+      }
+      return { success: false, error: String(err) };
     }
-    console.error("[Calendar] イベント削除エラー", err);
-    return { success: false, error: String(err) };
   }
+
+  console.error("[Calendar] 全カレンダーでイベント未検出", { eventId, tried: allIds });
+  return { success: false, error: `Event ${eventId} not found on any calendar` };
 }
 
 /**

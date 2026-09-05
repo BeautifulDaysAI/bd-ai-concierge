@@ -114,9 +114,10 @@ Vercel への本番デプロイ手順を完全網羅：
 22:00 JST  → morning-draft            (AI生成)
 07:00 JST  → morning-reminder         (未承認再通知)
 07:30 JST  → morning-deliver          (一斉配信)
+10:00 JST  → appointment-reminder     (アポ前日リマインダー)
 ```
 
-vercel.json に4つのCron設定済み。
+vercel.json に5つのCron設定済み。
 
 ---
 
@@ -202,7 +203,7 @@ Week 1-4 で **51ファイル超** の本格的な LINE AI コンシェルジュ
 ├─ コード: TypeScript 45ファイル
 ├─ DB:    7テーブル + Cleanup Cron
 ├─ 管理画面: 8ページ
-├─ Cron: 4ジョブ
+├─ Cron: 5ジョブ
 └─ ドキュメント: 7ファイル
 ```
 

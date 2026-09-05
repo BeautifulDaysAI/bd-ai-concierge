@@ -24,12 +24,14 @@ bd-ai-concierge を本番環境（Vercel）にデプロイする手順です。
 2. プライベートリポジトリ `bd-ai-concierge` を作成
 3. ローカルから push：
 
-```bash
-cd C:\Users\motoki\OneDrive\デスクトップ\BD-Projects\bd-ai-concierge
+このリポジトリは既に `git init` 済み（コミット履歴あり）。`git init` はやり直さず、リモート登録と push のみ行う。
 
-git init
+```bash
+cd C:\Users\motoki\OneDrive\デスクトップ\クラウドコード\bd-ai-concierge\bd-ai-concierge
+
+# 既存リポジトリ前提。未コミットの変更があればここでコミット
 git add .
-git commit -m "Initial: Week 1-4 完成"
+git commit -m "chore: 本番デプロイ前の同期"
 git branch -M main
 git remote add origin https://github.com/BeautifulDays/bd-ai-concierge.git
 git push -u origin main
@@ -117,11 +119,12 @@ Supabase ダッシュボード → Authentication → Users で：
 ### 4.5 Vercel Cron の動作確認
 
 Vercel ダッシュボード → 該当プロジェクト → Cron Jobs：
-- 4つのCronが登録されているか確認
+- 5つのCronが登録されているか確認
   - `/api/cron/morning-draft` （22:00 JST）
   - `/api/cron/morning-reminder` （07:00 JST）
   - `/api/cron/morning-deliver` （07:30 JST）
   - `/api/cron/cleanup-deleted-members` （00:00 JST）
+  - `/api/cron/appointment-reminder` （10:00 JST・アポ前日リマインダー）
 
 ---
 
